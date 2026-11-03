@@ -1,7 +1,7 @@
 """
 inference.py
 ------------
-Spillover effects and their inference (paper, eq. (2.3) and Section 6).
+Spillover effects and their inference (paper, eqs. (2.2)-(2.3) and Section 6).
 
 The effect of regressor k is the N x N matrix
 
