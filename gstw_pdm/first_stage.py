@@ -5,10 +5,10 @@ OLS first-stage estimation of the entry equation
 
     h = Z_W π + ε
 
-where h is the vector of period-level outcomes that drive endogenous W
-(e.g., h_t = Moran's I in period t), Z_W is a matrix of instruments
-excluded from the structural equation, and ε is the entry-equation
-disturbance.
+where h is the variable that forms the weights: one value per unit and
+period (L = N, e.g. a city's accessibility in year t; the main case of the
+paper) or one value per period (L = T, e.g. Moran's I in period t). Z_W are
+the instruments and ε is the formation shock (paper, eq. (3.1)).
 
 The residuals ε̂ are subsequently passed to control_function.py to form
 the control function ε̄̂ = A ε̂.
@@ -17,6 +17,7 @@ the control function ε̄̂ = A ε̂.
 from __future__ import annotations
 import numpy as np
 from scipy import linalg
+from typing import Optional
 
 
 def first_stage(h: np.ndarray,
@@ -135,3 +136,38 @@ def projection_matrix(Z_W: np.ndarray) -> np.ndarray:
         Z_W = Z_W[:, None]
     ZtZ_inv = linalg.pinv(Z_W.T @ Z_W)
     return Z_W @ ZtZ_inv @ Z_W.T
+
+
+def first_stage_fit(h: np.ndarray, Z_W: np.ndarray, n_instruments: Optional[int] = None) -> dict:
+    """
+    First stage h = Z_W pi + eps (paper, eq. (3.1)) in the form the estimators use.
+
+    Z_W holds the excluded instruments first and then any included regressors
+    (intercept, X, period dummies). Returns eps_hat, Z (rank-checked), pi, sigma2
+    (sigma_eps^2 with L - k_z degrees of freedom), ZtZ_inv, V_iid, dof, R2, and, with
+    n_instruments, the F statistic of the first n_instruments columns.
+    Pass the result in first_stages={'name': ...} to cf_qmle or cf_2sls.
+    """
+    from scipy import stats as scipy_stats
+    h = np.asarray(h, float).ravel()
+    Z = np.asarray(Z_W, float)
+    if Z.ndim == 1:
+        Z = Z[:, None]
+    q, r, piv = linalg.qr(Z, mode="economic", pivoting=True)
+    d = np.abs(np.diag(r))
+    keep = np.sort(piv[d > 1e-9 * d.max()])
+    Z = Z[:, keep]
+    L, k = Z.shape
+    inv = linalg.inv(Z.T @ Z)
+    pi = inv @ (Z.T @ h)
+    e = h - Z @ pi
+    s2 = float(e @ e / (L - k))
+    hc = h - h.mean()
+    out = {"eps_hat": e, "Z": Z, "keep": keep, "pi": pi, "sigma2": s2, "ZtZ_inv": inv,
+           "V_iid": s2 * inv, "dof": L - k, "L": L, "R2": 1 - float(e @ e) / float(hc @ hc)}
+    if n_instruments:
+        kz = int(np.sum(keep < n_instruments))
+        b = pi[:kz]
+        F = float(b @ linalg.solve(out["V_iid"][:kz, :kz], b) / kz)
+        out.update({"F": F, "F_p": float(scipy_stats.f.sf(F, kz, L - k)), "n_instruments": kz})
+    return out

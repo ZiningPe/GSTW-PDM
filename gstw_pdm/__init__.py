@@ -1,151 +1,94 @@
 """
 gstw_pdm
-=================
-Control-Function estimators for Spatial Durbin Models with endogenous
-Spatio-Temporal Weight Matrices (STWM).
+========
+Spatial Durbin panels with same-period and cross-period weights that may be
+endogenous (Wang, "Generalized Spatio-Temporally Weighted Panel Data Model").
 
-Integrates and extends the ZiningPe/STWM package with:
-  - CF-2SLS, CF-QMLE, CF-GMM estimators
-  - Kronecker-structure weight matrix utilities
-  - Cross-period indirect effects with Delta-method SE
-  - Benjamini-Hochberg FDR correction
-  - Ω_A variance correction for generated regressors (L = T case)
+Model (time-major rows):
 
-Quick start
------------
->>> import numpy as np
->>> from gstw_pdm import (
-...     rook_weights, build_twm_parametric, build_stwm,
-...     first_stage, aggregate_eps_hat,
-...     cf_2sls_fit, cf_qmle, cf_gmm_fit,
-...     cross_period_effects_matrix, bh_correction,
-... )
+    Y = rho_0 W_0 Y + rho_1 W_1 Y + X beta + W_0 X theta_0 + W_1 X theta_1 + V,
+    V = delta_c A eps + xi,   h = Z_W pi + eps,
 
-References
-----------
-Wang, Z. (2025). Endogenous Spatio-Temporal Weight Matrices and the
-Control-Function Approach. Working paper.
+with W_0 the same-period blocks and W_1 the cross-period blocks of the weight
+matrix, and h the variable that forms the weights.
+
+  * networks      : KroneckerNetwork (M kron W_S), RecursiveNetwork (only the past
+                    transmits, Lemma 2), DenseNetwork (any W), TiedNetwork
+  * L = N         : cf_qmle (Theorems 1-2, two-step variance), cf_2sls
+  * unit effects  : dummy_qmle, dummy_drift (Proposition 2), aqs_fit (Theorem 3), cf_2sls_fe
+  * L = T         : within_period_qmle (Theorem 4), anderson_rubin (Appendix I)
+  * effects       : effects_inference (Section 6) with BH / BY control
 """
 
 from .weight_construction import (
-    # Spatial weight matrices
-    rook_weights,
-    queen_weights,
-    inverse_distance_weights,
-    knn_weights,
-    # Temporal statistics
-    compute_morans_i,
-    compute_gearys_c,
-    compute_getis_ord_g,
-    compute_spatial_gini,
-    # Temporal weight matrix builders
-    build_twm_from_stats,
-    build_twm_parametric,
-    # Full STWM assembler
-    build_stwm,
-    stwm_summary,
-    # Kronecker eigenvalue utilities
-    eigvals_kronecker,
-    logdet_kronecker,
-    delta_admissible_range,
+    rook_weights, queen_weights, inverse_distance_weights, knn_weights,
+    compute_morans_i, compute_gearys_c, compute_getis_ord_g, compute_spatial_gini,
+    build_twm_from_stats, build_twm_parametric,
+    kronecker_weights, block_row_normalise, parameter_space, stwm_summary,
+    eigvals_kronecker, logdet_kronecker,
 )
 
-from .first_stage import (
-    first_stage,
-    first_stage_stats,
-    projection_matrix,
+from .first_stage import first_stage, first_stage_stats, first_stage_fit, projection_matrix
+
+from .control_function import aggregate_eps_hat, aggregation_matrix, detect_mode
+
+from .multi_w import (
+    split_same_cross, city_demean,
+    RecursiveNetwork, DenseNetwork, KroneckerNetwork, TiedNetwork, make_network,
 )
 
-from .control_function import (
-    aggregate_eps_hat,
-    aggregation_matrix,
-    detect_mode,
-)
+from .cf_qmle import cf_qmle, qmle, build_design, profile_loglik, wald_delta_c
 
-from .cf_2sls import (
-    cf_2sls,
-    cf_2sls_avar,
-    cf_2sls_se,
-    cf_2sls_fit,
-    cf_2sls_summary,
-)
+from .cf_2sls import cf_2sls, cf_2sls_design, cf_2sls_summary
 
-from .cf_qmle import (
-    logdet_kronecker as qmle_logdet_kronecker,
-    logdet_full,
-    profile_loglik,
-    cf_qmle,
-    cf_qmle_avar,
-    qmle_static,
-)
+from .period_level import within_period_qmle, anderson_rubin, ar_confidence_set, complement_basis
 
-from .cf_gmm import (
-    moment_vector,
-    cf_gmm,
-    cf_gmm_avar,
-    cf_gmm_fit,
+from .fixed_effects import (
+    first_stage_fe, joint_pi_covariance, WithinDesign, dummy_qmle, dummy_drift,
+    aqs_solve, aqs_variance, aqs_fit, cf_2sls_fe, wald_test, restriction_matrix,
 )
 
 from .inference import (
-    multiplier_matrix,
-    multiplier_matrix_approx,
-    cross_period_effect,
-    cross_period_effects_matrix,
-    delta_method_se,
-    ie_inference,
-    bh_correction,
-    multiple_testing_summary,
-    print_ie_table,
-)
-
-from .variance_correction import (
-    omega_A,
-    omega_A_simple,
-    compute_sigma2_eps,
-    cf_2sls_avar_corrected,
+    spillover_effects, effects_inference,
+    fdr_correction, bh_correction, by_correction, print_ie_table,
 )
 
 from .utils import (
-    ned_test,
-    eigs_sorted,
-    spectral_radius,
-    check_admissibility,
-    to_time_major,
-    to_unit_major,
-    panel_demean,
-    matrix_condition,
-    check_instrument_strength,
-    summarise_results,
+    ned_test, eigs_sorted, spectral_radius, check_admissibility,
+    to_time_major, to_unit_major, panel_demean, matrix_condition, check_instrument_strength,
 )
 
-__version__ = "0.1.0"
-__author__  = "Wang Zining"
+from .report import stars, regression_table, comparison_table, tests_block, horizon_table
+
+__version__ = "0.3.0"
+__author__ = "Wang Zining"
 __all__ = [
-    # weight construction
+    # weights
     "rook_weights", "queen_weights", "inverse_distance_weights", "knn_weights",
-    "compute_morans_i", "compute_gearys_c", "compute_getis_ord_g",
-    "compute_spatial_gini", "build_twm_from_stats", "build_twm_parametric",
-    "build_stwm", "stwm_summary", "eigvals_kronecker", "logdet_kronecker",
-    "delta_admissible_range",
-    # first stage
-    "first_stage", "first_stage_stats", "projection_matrix",
-    # control function
+    "compute_morans_i", "compute_gearys_c", "compute_getis_ord_g", "compute_spatial_gini",
+    "build_twm_from_stats", "build_twm_parametric",
+    "kronecker_weights", "block_row_normalise", "parameter_space", "stwm_summary",
+    "eigvals_kronecker", "logdet_kronecker",
+    # first stage and control function
+    "first_stage", "first_stage_stats", "first_stage_fit", "projection_matrix",
     "aggregate_eps_hat", "aggregation_matrix", "detect_mode",
-    # CF-2SLS
-    "cf_2sls", "cf_2sls_avar", "cf_2sls_se", "cf_2sls_fit", "cf_2sls_summary",
-    # CF-QMLE
-    "logdet_full", "profile_loglik", "cf_qmle", "cf_qmle_avar", "qmle_static",
-    # CF-GMM
-    "moment_vector", "cf_gmm", "cf_gmm_avar", "cf_gmm_fit",
-    # inference
-    "multiplier_matrix", "multiplier_matrix_approx",
-    "cross_period_effect", "cross_period_effects_matrix",
-    "delta_method_se", "ie_inference", "bh_correction",
-    "multiple_testing_summary", "print_ie_table",
-    # variance correction
-    "omega_A", "omega_A_simple", "compute_sigma2_eps", "cf_2sls_avar_corrected",
+    # networks
+    "split_same_cross", "city_demean",
+    "RecursiveNetwork", "DenseNetwork", "KroneckerNetwork", "TiedNetwork", "make_network",
+    # L = N estimators
+    "cf_qmle", "qmle", "build_design", "profile_loglik", "wald_delta_c",
+    "cf_2sls", "cf_2sls_design", "cf_2sls_summary",
+    # L = T
+    "within_period_qmle", "anderson_rubin", "ar_confidence_set", "complement_basis",
+    # unit fixed effects at fixed T
+    "first_stage_fe", "joint_pi_covariance", "WithinDesign", "dummy_qmle", "dummy_drift",
+    "aqs_solve", "aqs_variance", "aqs_fit", "cf_2sls_fe", "wald_test", "restriction_matrix",
+    # effects and multiple testing
+    "spillover_effects", "effects_inference",
+    "fdr_correction", "bh_correction", "by_correction", "print_ie_table",
     # utils
     "ned_test", "eigs_sorted", "spectral_radius", "check_admissibility",
-    "to_time_major", "to_unit_major", "panel_demean",
-    "matrix_condition", "check_instrument_strength", "summarise_results",
+    "to_time_major", "to_unit_major", "panel_demean", "matrix_condition", "check_instrument_strength",
+    # reporting
+    "stars", "regression_table", "comparison_table", "tests_block", "horizon_table",
 ]

@@ -4,15 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "GSTW-PDM"
-version = "0.1.0"
-description = "Generalized Spatio-Temporally Weighted Panel Data Model: Control-Function estimators (CF-2SLS, CF-QMLE, CF-GMM) for Spatial Durbin Models with endogenous Spatio-Temporal Weight Matrices"
+version = "0.3.0"
+description = "Generalized Spatio-Temporally Weighted Panel Data Model: spatial Durbin panels with same- and cross-period weights that may be endogenous (CF-QMLE, CF-2SLS, adjusted quasi-score, within-period QMLE)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
-    "statsmodels>=0.14",
 ]
 
 [project.optional-dependencies]

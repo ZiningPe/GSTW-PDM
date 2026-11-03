@@ -1,7 +1,7 @@
 """
 weight_construction.py
 ----------------------
-Build the spatio-temporal weight matrix W = M ⊗ W_S and the temporal weight
+Build the weight blocks W_0 = I_T ⊗ W_S, W_1 = M ⊗ W_S and the temporal weight
 matrix (TWM) M from data-driven statistics (Moran's I, Geary's C, Getis-Ord G,
 Spatial Gini, or parametric decay).
 
@@ -214,7 +214,8 @@ def _norm_row(M: np.ndarray) -> np.ndarray:
 def build_twm_from_stats(stats: Sequence[float],
                           method: Literal["moran", "geary", "getis", "gini",
                                           "raw"] = "moran",
-                          row_standardize: bool = True) -> np.ndarray:
+                          row_standardize: bool = True,
+                          bandwidth: float = 1.0) -> np.ndarray:
     """
     Build a T×T temporal weight matrix M from a sequence of T spatial
     statistics (one per period).
@@ -222,7 +223,7 @@ def build_twm_from_stats(stats: Sequence[float],
     The (t, s) entry of M is proportional to the *similarity* of period t
     and period s as measured by their statistics:
 
-        M_raw[t, s] = exp(-|stat_t - stat_s|)   (Gaussian-like kernel)
+        M_raw[t, s] = exp(-|stat_t - stat_s| / b),  t != s   (paper, Section 2.2)
 
     Zero diagonal is enforced before row-normalisation.
 
@@ -232,6 +233,7 @@ def build_twm_from_stats(stats: Sequence[float],
     method         : label used for display only (all methods use the same
                      kernel — pass ``method='raw'`` if stats are pre-computed)
     row_standardize: row-normalise M (recommended)
+    bandwidth      : b in the kernel
 
     Returns
     -------
@@ -240,7 +242,7 @@ def build_twm_from_stats(stats: Sequence[float],
     s = np.asarray(stats, float)
     T = len(s)
     diff = np.abs(s[:, None] - s[None, :])
-    M = np.exp(-diff)
+    M = np.exp(-diff / bandwidth)
     np.fill_diagonal(M, 0.0)
     if row_standardize:
         M = _norm_row(M)
@@ -281,34 +283,74 @@ def build_twm_parametric(T: int,
 
 
 # ---------------------------------------------------------------------------
-# 4.  Assemble W = M ⊗ W_S (or a custom non-Kronecker matrix)
+# 4.  Same-period and cross-period blocks (paper, Section 2)
 # ---------------------------------------------------------------------------
 
-def build_stwm(M: np.ndarray,
-               W_S: np.ndarray,
-               row_standardize: bool = False) -> np.ndarray:
+def kronecker_weights(M: np.ndarray, W_S: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build the full N×N spatio-temporal weight matrix W = M ⊗ W_S.
+    Kronecker weights of Section 2.2: W_0 = I_T kron W_S (same period),
+    W_1 = M kron W_S (cross period), W = W_0 + W_1.
 
-    If M and W_S are already row-normalised, the Kronecker product is also
-    row-normalised and ``row_standardize`` can stay False.
-
-    Parameters
-    ----------
-    M              : (T, T) temporal weight matrix (row-normalised recommended)
-    W_S            : (n, n) spatial weight matrix  (row-normalised recommended)
-    row_standardize: apply an additional row-normalisation pass after kron
-
-    Returns
-    -------
-    W : (n*T, n*T) = (N, N) spatio-temporal weight matrix
+    M must have a zero diagonal. With W_S and M row-stochastic each row of W_0
+    and each row of W_1 sums to one (Assumption 3(i)).
     """
-    W = np.kron(M, W_S)
-    if row_standardize:
-        rs = W.sum(axis=1, keepdims=True)
+    M, W_S = np.asarray(M, float), np.asarray(W_S, float)
+    if np.any(np.diag(M) != 0):
+        raise ValueError("M must have a zero diagonal; the same-period links are in W_0")
+    return np.kron(np.eye(M.shape[0]), W_S), np.kron(M, W_S)
+
+
+def block_row_normalise(W, n: int, T: int):
+    """
+    Row-normalise the same-period part and the cross-period part of W separately
+    (Assumption 3(i)); returns (W_0, W_1). Normalising the whole row would shrink
+    the same-period share as source periods accumulate.
+    """
+    from scipy import sparse
+    W = sparse.csr_matrix(W, dtype=float)
+    year = np.repeat(np.arange(T), n)
+    C = W.tocoo()
+    same = year[C.row] == year[C.col]
+    out = []
+    for mask in (same, ~same):
+        B = sparse.csr_matrix((C.data[mask], (C.row[mask], C.col[mask])), shape=W.shape)
+        rs = np.asarray(B.sum(1)).ravel()
         rs[rs == 0] = 1.0
-        W = W / rs
-    return W
+        out.append(sparse.diags(1 / rs) @ B)
+    return out[0].tocsr(), out[1].tocsr()
+
+
+def parameter_space(W0, W1, n: int, T: int) -> dict:
+    """
+    Check Assumption 3 and Lemma 2 for given blocks and report the parameter space.
+
+    Returns the maximum row sums of W_0 and W_1 (each must be <= 1), the column-sum
+    bound c_W of W, the column-sum bound c_0 of the diagonal blocks, whether W is
+    recursive (no block above the diagonal), and the implied bounds:
+    |rho0| + |rho1| < 1/max(1, c_W) in general (Assumption 3(iii)); with recursive
+    weights only |rho0| < 1/max(1, c_0) is needed and rho1 is unrestricted (Lemma 2).
+    """
+    from scipy import sparse
+    W0, W1 = sparse.csr_matrix(W0), sparse.csr_matrix(W1)
+    W = (W0 + W1).tocoo()
+    year = np.repeat(np.arange(T), n)
+    recursive = not bool(np.any(year[W.col][W.data != 0] > year[W.row][W.data != 0]))
+    D = W0.tocoo()
+    diag_only = bool(np.all(year[D.row] == year[D.col]))
+    c_W = float(np.abs(W0 + W1).sum(0).max())
+    c_0 = float(max(np.abs(W0[t * n:(t + 1) * n, t * n:(t + 1) * n]).sum(0).max() for t in range(T)))
+    return {
+        "row_sum_W0": float(np.abs(W0).sum(1).max()),
+        "row_sum_W1": float(np.abs(W1).sum(1).max()),
+        "zero_diagonal": bool(np.all((W0 + W1).diagonal() == 0)),
+        "nonnegative": bool((W0.data >= 0).all() and (W1.data >= 0).all()),
+        "W0_block_diagonal": diag_only,
+        "recursive": recursive,
+        "c_W": c_W,
+        "c_0": c_0,
+        "bound_rho_sum": 1 / max(1.0, c_W),
+        "bound_rho0_recursive": 1 / max(1.0, c_0) if recursive else None,
+    }
 
 
 def stwm_summary(W: np.ndarray, n: int, T: int) -> dict:
@@ -346,65 +388,24 @@ def stwm_summary(W: np.ndarray, n: int, T: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5.  Eigenvalue helpers (used by CF-QMLE log-det)
+# 5.  Eigenvalue helpers (Kronecker log-determinant, eq. (2.5))
 # ---------------------------------------------------------------------------
 
-def eigvals_kronecker(M: np.ndarray,
-                      W_S: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def eigvals_kronecker(M: np.ndarray, W_S: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Eigenvalues (complex) of M and W_S for the Kronecker log-determinant."""
+    return linalg.eigvals(M), linalg.eigvals(W_S)
+
+
+def logdet_kronecker(rho, eigvals_M: np.ndarray, eigvals_WS: np.ndarray) -> float:
     """
-    Compute eigenvalues of M and W_S separately for fast Kronecker log-det.
+    ln|det(I - rho0 I_T kron W_S - rho1 M kron W_S)|
+        = sum_j sum_i ln|1 - (rho0 + rho1 mu_j) lambda_i|        (paper, eq. (2.5))
 
-    The eigenvalues of M ⊗ W_S are {μ_j · λ_k} for all j, k.
-
-    Returns
-    -------
-    eigvals_M  : (T,) real part of eigenvalues of M
-    eigvals_WS : (n,) real part of eigenvalues of W_S
+    rho = (rho0, rho1). Returns -inf if the matrix is singular.
     """
-    return linalg.eigvals(M).real, linalg.eigvals(W_S).real
-
-
-def logdet_kronecker(delta: float,
-                     eigvals_M: np.ndarray,
-                     eigvals_WS: np.ndarray) -> float:
-    """
-    Fast log|I_N - delta·W| exploiting Kronecker structure:
-
-        ln|I - δ·(M⊗W_S)| = Σ_j Σ_k ln|1 - δ·μ_j·λ_k|
-
-    Parameters
-    ----------
-    delta     : spatial-lag coefficient
-    eigvals_M : (T,) eigenvalues of M
-    eigvals_WS: (n,) eigenvalues of W_S
-
-    Returns
-    -------
-    log-determinant (float, -inf if the matrix is singular for this delta)
-    """
-    total = 0.0
-    for mu in eigvals_M:
-        for lam in eigvals_WS:
-            val = 1.0 - delta * mu * lam
-            if val <= 0:
-                return -np.inf
-            total += np.log(abs(val))
-    return total
-
-
-def delta_admissible_range(eigvals_M: np.ndarray,
-                            eigvals_WS: np.ndarray) -> tuple[float, float]:
-    """
-    Compute the admissible interval for delta so that I - delta·W is
-    non-singular, i.e. all 1 - delta·μ_j·λ_k > 0.
-
-    Returns (delta_min, delta_max) such that delta ∈ (delta_min, delta_max)
-    guarantees |I - delta·W| ≠ 0.
-    """
-    products = np.outer(eigvals_M, eigvals_WS).ravel()
-    pos = products[products > 0]
-    neg = products[products < 0]
-    lo = float(-1.0 / pos.max()) if len(pos) else -np.inf
-    hi = float(-1.0 / neg.min()) if len(neg) else np.inf
-    # clamp to (-1, 1) for practical stability
-    return max(lo, -0.9999), min(hi, 0.9999)
+    rho0, rho1 = rho
+    z = 1 - np.outer(rho0 + rho1 * np.asarray(eigvals_M), np.asarray(eigvals_WS))
+    a = np.abs(z)
+    if not np.all(a > 1e-12):
+        return -np.inf
+    return float(np.sum(np.log(a)))

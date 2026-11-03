@@ -1,362 +1,340 @@
 """
 cf_qmle.py
 ----------
-Control-Function Quasi-Maximum Likelihood Estimator (CF-QMLE) for Spatial
-Durbin Models with endogenous Spatio-Temporal Weight Matrices.
+Control-function QMLE (paper, Section 3 eq. (3.5), Theorems 1-2).
 
-Model
------
-    Y = δ·WY + X·β + WX·θ + ε̄̂·δ_c + ξ,    ξ ~ N(0, σ²·I_N)
+Model, time-major rows (period by period, units within period):
 
-    ⟺  S(δ)·Y = R·α + ξ,
-        S(δ) = I_N − δ·W,
-        R    = [X, WX, ε̄̂],
-        α    = (β, θ, δ_c)
+    Y = sum_j rho_j W_j Y + X beta + sum_j W_j X theta_j + E gamma_E + eb_hat delta_c + xi
 
-Profile log-likelihood (concentrated over α, σ²)
--------------------------------------------------
-    ℓ_p(δ) = ln|S(δ)| − (N/2)·ln(σ̂²(δ))
+The paper's case has two lag matrices, the same-period blocks W_0 and the
+cross-period blocks W_1 of one weight matrix; any number of lag matrices is
+allowed (for example two networks, each split by split_same_cross). E holds
+regressors without a spatial lag (intercept, period dummies). eb_hat = A eps_hat
+is the first-stage residual of the formation equation h = Z_W pi + eps, with
+A = I_N when L = N and A = I_T kron iota_n when L = T.
 
-    σ̂²(δ) = ‖M_R S(δ)Y‖² / N,   M_R = I − R(R'R)^{-1}R'
+Given rho, the other mean parameters are OLS coefficients of S(rho) Y on
+R = [X, W_j X, E, eb_hat] and sigma2 is the residual mean square, so the
+likelihood is maximised over rho only. ln|det S(rho)| comes from the network:
+KroneckerNetwork (eigenvalues of M and W_S), RecursiveNetwork (same-period
+blocks only, Lemma 2) or DenseNetwork (N x N factorisation).
 
-For the Kronecker structure W = M ⊗ W_S, the log-determinant is computed via:
+Variance (Theorem 2, L = N):
 
-    ln|I_N − δ·W| = Σ_j Σ_k ln|1 − δ·μ_j·λ_k|
+    Var = I^{-1} (V + D Sigma_pi D') I^{-1},
 
-where μ_j are eigenvalues of M (T×T) and λ_k are eigenvalues of W_S (n×n).
-This reduces the cost from O(N³) to O(T·n) evaluations.
-
-For a custom (non-Kronecker) W, the log-det is computed directly from the
-eigenvalues of the full N×N matrix (precomputed once).
-
-References
-----------
-Paper Section 6 & Appendix C.
+with I the information, V the variance of the score from Lemma 9 (linear-quadratic
+forms, mu3 and mu4 of the residuals), and D Sigma_pi D' the generated-regressor
+term: D has rows delta_c / sigma2 * Ubar' Z_W on the (rho, beta, theta, E)
+coordinates and zero rows on delta_c and sigma2, Sigma_pi = sigma_eps^2 (Z_W'Z_W)^{-1}.
+At L = T the expansion is not valid (Proposition 3): the estimator converges to a
+point that depends on the realised period shocks. Use within_period_qmle there.
 """
 
 from __future__ import annotations
+import warnings
 import numpy as np
-from scipy import linalg, optimize
-from typing import Optional, Tuple
+from scipy import linalg, optimize, stats
+from typing import Optional, Sequence
 
 
 # ---------------------------------------------------------------------------
-# Log-determinant helpers
+# design
 # ---------------------------------------------------------------------------
 
-def logdet_kronecker(delta: float,
-                     eigvals_M: np.ndarray,
-                     eigvals_WS: np.ndarray) -> float:
-    """
-    Efficient log|I − δ·(M⊗W_S)| via Kronecker eigenvalue decomposition.
-
-    Returns -inf if (I − δW) is singular for this δ.
-    """
-    total = 0.0
-    for mu in eigvals_M:
-        for lam in eigvals_WS:
-            val = 1.0 - delta * mu * lam
-            if val <= 0:
-                return -np.inf
-            total += np.log(abs(val))
-    return total
+def _full_rank(A: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    if A.shape[1] == 0:
+        return np.zeros(0, int)
+    q, r, piv = linalg.qr(A, mode="economic", pivoting=True)
+    d = np.abs(np.diag(r))
+    return np.sort(piv[d > tol * d.max()])
 
 
-def logdet_full(delta: float, eigvals_W: np.ndarray) -> float:
-    """
-    log|I − δ·W| from precomputed eigenvalues of the full W matrix.
+def _cols(a, N):
+    if a is None:
+        return np.zeros((N, 0))
+    a = np.asarray(a, float)
+    return a[:, None] if a.ndim == 1 else a
 
-    Use for non-Kronecker W.  Precompute eigvals_W = np.linalg.eigvals(W).real
-    once before optimisation.
+
+def control_from_first_stage(fs: dict, n: int, T: int) -> np.ndarray:
+    """eb_hat = A eps_hat: A = I_N if the first stage has N rows, I_T kron iota_n if it has T."""
+    e = np.asarray(fs["eps_hat"], float)
+    if len(e) == n * T:
+        return e.copy()
+    if len(e) == T:
+        return np.repeat(e, n)
+    raise ValueError(f"first stage has {len(e)} rows; expected N = {n * T} or T = {T}")
+
+
+def build_design(y, X, net, durbin: bool = True, extra=None, first_stages: Optional[dict] = None,
+                 controls: Optional[dict] = None, x_names=None, extra_names=None):
     """
-    vals = 1.0 - delta * eigvals_W
-    if np.any(vals <= 0):
-        return -np.inf
-    return float(np.sum(np.log(np.abs(vals))))
+    Lag columns U = [W_j y] and regressors R = [X, W_j X, E, controls].
+
+    Returns (U, R, R_names, ctrl), ctrl mapping a first-stage name to its column in R.
+    Columns of R that are collinear with earlier ones (for example W_j iota when X
+    has an intercept and W_j is row-normalised) are dropped.
+    """
+    y = np.asarray(y, float).ravel()
+    N = len(y)
+    X = _cols(X, N)
+    E = _cols(extra, N)
+    x_names = list(x_names) if x_names is not None else [f"x{i + 1}" for i in range(X.shape[1])]
+    e_names = list(extra_names) if extra_names is not None else [f"e{i + 1}" for i in range(E.shape[1])]
+    U = np.column_stack([W @ y for W in net.W])
+    blocks, names = [X], list(x_names)
+    if durbin:
+        for nm, W in zip(net.names, net.W):
+            blocks.append(W @ X)
+            names += [f"{nm}*{x}" for x in x_names]
+    blocks.append(E)
+    names += e_names
+    cols, cnames = [], []
+    for m, fs in (first_stages or {}).items():
+        cols.append(control_from_first_stage(fs, net.n, net.T))
+        cnames.append("delta_" + m)
+    for m, c in (controls or {}).items():
+        cols.append(np.asarray(c, float).ravel())
+        cnames.append("delta_" + m)
+    R = np.column_stack(blocks + ([np.column_stack(cols)] if cols else []))
+    names += cnames
+    keep = _full_rank(R)
+    R = R[:, keep]
+    names = [names[i] for i in keep]
+    ctrl = {m: names.index("delta_" + m) for m in (first_stages or {}) if "delta_" + m in names}
+    return U, R, names, ctrl
 
 
 # ---------------------------------------------------------------------------
-# Profile log-likelihood
+# profile likelihood
 # ---------------------------------------------------------------------------
 
-def profile_loglik(delta: float,
-                   Y: np.ndarray,
-                   W: np.ndarray,
-                   R: np.ndarray,
-                   logdet_fn,
-                   sign: float = -1.0) -> float:
-    """
-    Compute  sign · ℓ_p(δ)  (sign=-1 for minimisation).
-
-    Parameters
-    ----------
-    delta     : candidate spatial-lag parameter
-    Y         : (N,) dependent variable
-    W         : (N, N) weight matrix
-    R         : (N, p) augmented regressors  [X, WX, ε̄̂]
-    logdet_fn : callable(delta) → log|I − δW|
-    sign      : -1 for minimisation (default), +1 for likelihood value
-
-    Returns
-    -------
-    scalar (sign · profile log-likelihood)
-    """
-    N = len(Y)
-    S   = np.eye(N) - delta * W
-    SY  = S @ Y
-
-    # Concentrated OLS
-    RtR_inv = linalg.pinv(R.T @ R)
-    M_R_SY  = SY - R @ (RtR_inv @ (R.T @ SY))
-    sigma2   = float(M_R_SY @ M_R_SY) / N
-
-    if sigma2 <= 1e-14:
-        return np.inf * sign
-
-    ld = logdet_fn(delta)
+def profile_loglik(rho, net, yt: np.ndarray, Ut: np.ndarray, N: int) -> float:
+    """ln|det S(rho)| - N/2 ln sigma2(rho), with yt, Ut already residualised on R."""
+    ld = net.factor(rho)
     if not np.isfinite(ld):
-        return np.inf * sign
+        return -np.inf
+    e = yt - Ut @ np.asarray(rho, float)
+    return ld - 0.5 * N * np.log(e @ e / N)
 
-    ll = -N / 2.0 * (1.0 + np.log(2.0 * np.pi * sigma2)) + ld
-    return sign * ll
+
+def _maximise(net, yt, Ut, N, rho0):
+    def f(r):
+        if not np.all(np.isfinite(r)):
+            return 1e12
+        v = -profile_loglik(r, net, yt, Ut, N)
+        return min(v, 1e12) if np.isfinite(v) else 1e12
+    r = optimize.minimize(f, np.asarray(rho0, float), method="Nelder-Mead",
+                          options={"xatol": 1e-8, "fatol": 1e-10, "maxiter": 6000})
+    r2 = optimize.minimize(f, r.x, method="BFGS", options={"gtol": 1e-8})
+    best = r2 if r2.fun <= r.fun else r
+    return best.x, -best.fun
 
 
 # ---------------------------------------------------------------------------
-# CF-QMLE estimator
+# variance
 # ---------------------------------------------------------------------------
 
-def cf_qmle(Y: np.ndarray,
-            X: np.ndarray,
-            W: np.ndarray,
-            bar_eps_hat: np.ndarray,
-            M: Optional[np.ndarray] = None,
-            W_S: Optional[np.ndarray] = None,
-            delta_bounds: Optional[Tuple[float, float]] = None,
-            n_grid: int = 80) -> dict:
+def _moments(e: np.ndarray, s2: float, g: Optional[int]):
+    """mu3, mu4 of xi from residuals; with g, the residuals are deviations from means over groups of size g."""
+    if g is None or g <= 1:
+        return float(np.mean(e ** 3)), float(np.mean(e ** 4))
+    mu3 = float(np.mean(e ** 3) * g ** 2 / ((g - 1) * (g - 2))) if g > 2 else 0.0
+    k4 = (g - 1) * (g ** 2 - 3 * g + 3) / g ** 3
+    c4 = 3 * (g - 1) * (2 * g - 3) / g ** 3
+    return mu3, float((np.mean(e ** 4) - c4 * s2 ** 2) / k4)
+
+
+def qmle_information_and_score_variance(net, R: np.ndarray, rho, gamma, s2: float, mu3: float, mu4: float,
+                                        basis_diag=None, basis_vec=None):
     """
-    CF-QMLE estimation.
+    Information I and score variance V of zeta = (rho, gamma, sigma2) at the estimate.
 
-    Provide (M, W_S) for fast Kronecker log-det, or leave both None to
-    fall back to the full eigenvalue decomposition of W.
+    Score at the truth, with G_j = W_j S^{-1} and m = R gamma:
+        rho_j : (G_j m)' xi / s2 + xi' G_j xi / s2 - tr(G_j)
+        gamma : R' xi / s2
+        sigma2: xi' xi / (2 s2^2) - N / (2 s2)
+    V applies the linear-quadratic form lemma entry by entry. When the model is
+    estimated on transformed data xi* = P' xi (within-period deviations),
+    basis_diag(A) = diag(P A P') and basis_vec(c) = P c give the mu3/mu4 terms.
+    """
+    assert np.isfinite(net.factor(rho))
+    N = R.shape[0]
+    p, k = len(rho), R.shape[1]
+    P = p + k + 1
+    dg = basis_diag or (lambda A: np.diag(A).copy())
+    bv = basis_vec or (lambda c: c)
+    Sinv = net.inverse()
+    G = [np.asarray(W @ Sinv) for W in net.W]
+    del Sinv
+    m = R @ gamma
+    Gm = [Gj @ m for Gj in G]
+    trG = np.array([np.trace(Gj) for Gj in G])
+    trGG = np.array([[np.sum(G[j] * G[l].T) for l in range(p)] for j in range(p)])
+    trGtG = np.array([[np.sum(G[j] * G[l]) for l in range(p)] for j in range(p)])
+    dG = [dg(Gj) for Gj in G]
+    dI = dg(np.eye(N))
+    pGm = [bv(v) for v in Gm]
+    pR = bv(R)
+    del G
+
+    Info = np.zeros((P, P))
+    for j in range(p):
+        for l in range(p):
+            Info[j, l] = Gm[j] @ Gm[l] / s2 + trGtG[j, l] + trGG[j, l]
+        Info[j, p:p + k] = Info[p:p + k, j] = Gm[j] @ R / s2
+        Info[j, -1] = Info[-1, j] = trG[j] / s2
+    Info[p:p + k, p:p + k] = R.T @ R / s2
+    Info[-1, -1] = N / (2 * s2 ** 2)
+
+    # non-Gaussian terms of the linear-quadratic form lemma
+    k4 = mu4 - 3 * s2 ** 2
+    V = Info.copy()
+    for j in range(p):
+        for l in range(p):
+            V[j, l] += (mu3 * (pGm[j] @ dG[l] + pGm[l] @ dG[j]) + k4 * dG[j] @ dG[l]) / s2 ** 2
+        V[j, p:p + k] += mu3 * (dG[j] @ pR) / s2 ** 2
+        V[p:p + k, j] = V[j, p:p + k]
+        V[j, -1] += (mu3 * pGm[j] @ dI + k4 * dG[j] @ dI) / (2 * s2 ** 3)
+        V[-1, j] = V[j, -1]
+    V[p:p + k, -1] += mu3 * (dI @ pR) / (2 * s2 ** 3)
+    V[-1, p:p + k] = V[p:p + k, -1]
+    V[-1, -1] += k4 * (dI @ dI) / (4 * s2 ** 4)
+    return Info, V, trG
+
+
+def _Z(fs):
+    return np.asarray(fs["Z_within"] if "Z_within" in fs else fs["Z"], float)
+
+
+def joint_pi_covariance_pooled(first_stages: Sequence[dict]) -> np.ndarray:
+    """Cov(pi_hat) across first stages: sigma_ab (Z_a'Z_a)^{-1} Z_a'Z_b (Z_b'Z_b)^{-1}."""
+    e = [np.asarray(fs["eps_hat"], float) for fs in first_stages]
+    Zs = [_Z(fs) for fs in first_stages]
+    inv = [fs["ZtZ_inv"] if "ZtZ_inv" in fs else linalg.inv(Z.T @ Z) for fs, Z in zip(first_stages, Zs)]
+    dof = [fs.get("dof", len(ea) - Z.shape[1]) for fs, ea, Z in zip(first_stages, e, Zs)]
+    m = len(e)
+    blocks = [[(e[a] @ e[b] / min(dof[a], dof[b])) * inv[a] @ (Zs[a].T @ Zs[b]) @ inv[b]
+               for b in range(m)] for a in range(m)]
+    return np.block(blocks)
+
+
+def generated_regressor_term(Ubar: np.ndarray, gamma, ctrl: dict, first_stages: dict, s2: float,
+                             R: np.ndarray, p: int, k: int):
+    """
+    D and Sigma_pi of Theorem 2 for one or several first stages at L = N.
+
+    Rows of D: delta_c,m * scale_m / s2 * Ubar' Z_m on the coordinates in Ubar
+    (rho and every column of R except the controls); zero on the controls and sigma2.
+    The control column may be any multiple of eps_hat; the multiple is recovered.
+    """
+    modes = [m for m in first_stages if m in ctrl]
+    Sig = joint_pi_covariance_pooled([first_stages[m] for m in modes])
+    D = np.zeros((p + k + 1, Sig.shape[0]))
+    rows = list(range(p)) + [p + c for c in range(k) if c not in ctrl.values()]
+    off = 0
+    for m in modes:
+        Z = _Z(first_stages[m])
+        kz = Z.shape[1]
+        ci = ctrl[m]
+        eh = np.asarray(first_stages[m]["eps_hat"], float)
+        scale = float(R[:, ci] @ eh / (eh @ eh))
+        D[rows, off:off + kz] = gamma[ci] * scale * (Ubar.T @ Z) / s2
+        off += kz
+    return D, Sig
+
+
+# ---------------------------------------------------------------------------
+# estimator
+# ---------------------------------------------------------------------------
+
+def _fit(y, U, R, names, ctrl, net, first_stages, rho0, variance, basis_diag=None, basis_vec=None,
+         group=None, resid_orig=None, label="CF-QMLE"):
+    N, p, k = len(y), U.shape[1], R.shape[1]
+    Q = linalg.orth(R)
+    yt = y - Q @ (Q.T @ y)
+    Ut = U - Q @ (Q.T @ U)
+    rho0 = np.zeros(p) if rho0 is None else np.asarray(rho0, float)
+    rho, ll = _maximise(net, yt, Ut, N, rho0)
+    gamma = linalg.lstsq(R, y - U @ rho)[0]
+    e = y - U @ rho - R @ gamma
+    s2 = float(e @ e / N)
+    out = {"estimator": label, "rho": rho, "gamma": gamma, "sigma2": s2,
+           "theta": np.r_[rho, gamma, s2], "names": list(net.names) + list(names) + ["sigma2"],
+           "loglik": float(ll - 0.5 * N * (1 + np.log(2 * np.pi))), "resid": e, "N": N}
+    if not variance:
+        return out
+    er = e if resid_orig is None else resid_orig(e)
+    mu3, mu4 = _moments(er, s2, group)
+    Info, Vs, trG = qmle_information_and_score_variance(net, R, rho, gamma, s2, mu3, mu4, basis_diag, basis_vec)
+    Ii = linalg.inv(Info)
+    V_rob = Ii @ Vs @ Ii
+    V = V_rob
+    gen = {m: fs for m, fs in (first_stages or {}).items() if m in ctrl}
+    if gen:
+        if any(len(fs["eps_hat"]) != N for fs in gen.values()):
+            warnings.warn("first stage with L = T: Theorem 2 does not apply and the generated-regressor "
+                          "term is not added. The CF-QMLE is the naive estimator of Proposition 3 and "
+                          "is inconsistent unless delta_c = 0; use within_period_qmle.")
+        else:
+            nonctrl = [c for c in range(k) if c not in ctrl.values()]
+            Ubar = np.column_stack([U, R[:, nonctrl]])
+            D, Sig = generated_regressor_term(Ubar, gamma, ctrl, gen, s2, R, p, k)
+            V = Ii @ (Vs + D @ Sig @ D.T) @ Ii
+            out["D"], out["Sigma_pi"] = D, Sig
+    out.update({"V": V, "V_no_generated": V_rob, "V_information": Ii, "Information": Info,
+                "score_variance": Vs, "mu3": mu3, "mu4": mu4,
+                "se": np.sqrt(np.maximum(np.diag(V), 0)),
+                "se_information": np.sqrt(np.maximum(np.diag(Ii), 0))})
+    return out
+
+
+def cf_qmle(y, X, net, first_stages: Optional[dict] = None, controls: Optional[dict] = None,
+            durbin: bool = True, extra=None, x_names=None, extra_names=None,
+            rho0=None, variance: bool = True) -> dict:
+    """
+    Control-function QMLE with the two-step variance of Theorem 2.
 
     Parameters
     ----------
-    Y           : (N,) dependent variable
-    X           : (N, k) exogenous regressors
-    W           : (N, N) spatio-temporal weight matrix  (W = M⊗W_S or custom)
-    bar_eps_hat : (N,) control-function vector ε̄̂
-    M           : (T, T) temporal weight matrix  (Kronecker mode)
-    W_S         : (n, n) spatial weight matrix   (Kronecker mode)
-    delta_bounds: (lo, hi) search interval for δ; auto-computed if None
-    n_grid      : number of grid points for initial search
+    y, X        : (N,) outcome and (N, K) regressors, time-major.
+    net         : KroneckerNetwork, RecursiveNetwork, DenseNetwork or TiedNetwork;
+                  its lag matrices W_j define rho_j (paper: W_0 same period, W_1 cross period).
+    first_stages: {name: first_stage_fit(...) result}. The control A eps_hat enters R as
+                  'delta_<name>' and its first-stage uncertainty enters the variance.
+    controls    : {name: (N,) column} extra control functions without first-stage correction.
+    durbin      : include W_j X for every lag (theta_j).
+    extra       : (N, q) regressors without spatial lags (intercept, period dummies).
+    rho0        : starting value for rho.
 
     Returns
     -------
-    dict with keys:
-        delta_hat, alpha_hat (=(beta, theta, delta_c)), sigma2_hat,
-        loglik, eigvals_M, eigvals_WS (or eigvals_W), method
+    dict with theta = (rho, gamma, sigma2), names, se (Theorem 2), se_information
+    (information only), V, V_no_generated, loglik, resid, mu3, mu4.
     """
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    N   = len(Y)
-    bar_eps_hat = np.asarray(bar_eps_hat, float).ravel()
-
-    R = np.column_stack([X, W @ X, bar_eps_hat])  # (N, k+k+1)
-
-    # Set up log-det function and bounds
-    if M is not None and W_S is not None:
-        eig_M  = linalg.eigvals(M).real
-        eig_WS = linalg.eigvals(W_S).real
-        logdet_fn = lambda d: logdet_kronecker(d, eig_M, eig_WS)
-        method = "kronecker"
-        extra = {"eigvals_M": eig_M, "eigvals_WS": eig_WS}
-
-        if delta_bounds is None:
-            from .weight_construction import delta_admissible_range
-            lo, hi = delta_admissible_range(eig_M, eig_WS)
-            delta_bounds = (max(lo, -0.9999), min(hi, 0.9999))
-    else:
-        eig_W   = linalg.eigvals(W).real
-        logdet_fn = lambda d: logdet_full(d, eig_W)
-        method = "full"
-        extra = {"eigvals_W": eig_W}
-
-        if delta_bounds is None:
-            pos = eig_W[eig_W > 0]
-            neg = eig_W[eig_W < 0]
-            lo  = float(-1.0 / pos.max()) if len(pos) else -0.9999
-            hi  = float(-1.0 / neg.min()) if len(neg) else  0.9999
-            delta_bounds = (max(lo, -0.9999), min(hi, 0.9999))
-
-    lo, hi = delta_bounds
-    objective = lambda d: profile_loglik(d, Y, W, R, logdet_fn, sign=-1.0)
-
-    # Grid search for a good starting interval
-    grid = np.linspace(lo + 0.01 * (hi - lo), hi - 0.01 * (hi - lo), n_grid)
-    ll_grid = np.array([objective(d) for d in grid])
-    best_idx = int(np.argmin(ll_grid))
-    d_lo = grid[max(best_idx - 2, 0)]
-    d_hi = grid[min(best_idx + 2, n_grid - 1)]
-
-    # Brent refinement
-    res = optimize.minimize_scalar(
-        objective,
-        bounds=(d_lo, d_hi),
-        method="bounded",
-        options={"xatol": 1e-10, "maxiter": 500},
-    )
-    delta_hat = float(res.x)
-
-    # Recover α̂ = (β̂, θ̂, δ̂_c)
-    S        = np.eye(N) - delta_hat * W
-    SY       = S @ Y
-    RtR_inv  = linalg.pinv(R.T @ R)
-    alpha_hat = RtR_inv @ (R.T @ SY)
-    M_R_SY   = SY - R @ alpha_hat
-    sigma2_hat = float(M_R_SY @ M_R_SY) / N
-
-    return {
-        "delta_hat" : delta_hat,
-        "alpha_hat" : alpha_hat,   # (beta, theta, delta_c)
-        "sigma2_hat": sigma2_hat,
-        "loglik"    : float(-res.fun),
-        "method"    : method,
-        **extra,
-    }
+    U, R, names, ctrl = build_design(y, X, net, durbin, extra, first_stages, controls, x_names, extra_names)
+    y = np.asarray(y, float).ravel()
+    return _fit(y, U, R, names, ctrl, net, first_stages, rho0, variance)
 
 
-# ---------------------------------------------------------------------------
-# Asymptotic variance of CF-QMLE  (information matrix approach)
-# ---------------------------------------------------------------------------
+def qmle(y, X, net, durbin: bool = True, extra=None, x_names=None, extra_names=None,
+         rho0=None, variance: bool = True) -> dict:
+    """QMLE without a control function (exogenous weights, or the static model when net has W_0 only)."""
+    return cf_qmle(y, X, net, None, None, durbin, extra, x_names, extra_names, rho0, variance)
 
-def cf_qmle_avar(Y: np.ndarray,
-                 X: np.ndarray,
-                 W: np.ndarray,
-                 bar_eps_hat: np.ndarray,
-                 delta_hat: float,
-                 alpha_hat: np.ndarray,
-                 sigma2_hat: float,
-                 logdet_fn,
-                 h: float = 1e-5) -> np.ndarray:
+
+def wald_delta_c(fit: dict, names: Optional[Sequence[str]] = None) -> dict:
     """
-    Full asymptotic variance of sqrt(N)·(δ̂, α̂) via the numerical Hessian
-    of the joint log-likelihood (Theorem 7).
+    Wald test of delta_c = 0 with the information variance (paper, Appendix F.2).
 
-    The joint log-likelihood at fixed σ̂² is
-
-        L(δ, α) = log|I−δW| − (N/2)log(2πσ̂²)
-                  − ‖S(δ)Y − Rα‖² / (2σ̂²)
-
-    where S(δ) = I−δW,  R = [X, WX, ε̄̂],  α = (β, θ, δ_c).
-
-    The asymptotic variance is
-
-        AVar(δ̂, α̂) = N · (−∂²L/∂θ∂θ')⁻¹  at θ̂ = (δ̂, α̂).
-
-    Step sizes are scaled to parameter magnitude for numerical stability:
-        h_j = max(h, h · |θ̂_j|).
-
-    Parameters
-    ----------
-    delta_hat  : estimated δ
-    alpha_hat  : (k+k+1,) estimated (β, θ_coef, δ_c)
-    sigma2_hat : estimated σ² (concentrated value)
-    logdet_fn  : callable(delta) → log|I − δW|
-    h          : base finite-difference step
-
-    Returns
-    -------
-    avar : (2k+2, 2k+2) asymptotic variance matrix of sqrt(N)·(δ̂, α̂)
+    On the naive estimator at L = T the test is valid when no other period effects are
+    present; at L = N it is the usual exogeneity test of the weights.
     """
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    N   = len(Y)
-    bar_eps_hat = np.asarray(bar_eps_hat, float).ravel()
-    R   = np.column_stack([X, W @ X, bar_eps_hat])   # (N, k+k+1)
-
-    theta_hat = np.concatenate([[delta_hat], alpha_hat])
-    p = len(theta_hat)   # 2k+2
-
-    def loglik(theta):
-        delta = float(theta[0])
-        alpha = theta[1:]
-        ld = logdet_fn(delta)
-        if not np.isfinite(ld):
-            return -1e300
-        S   = np.eye(N) - delta * W
-        res = S @ Y - R @ alpha
-        return ld - N / 2.0 * np.log(2.0 * np.pi * sigma2_hat) \
-               - float(res @ res) / (2.0 * sigma2_hat)
-
-    # Numerical Hessian via central differences
-    ll0 = loglik(theta_hat)
-    H   = np.zeros((p, p))
-    for i in range(p):
-        hi = max(h, h * abs(float(theta_hat[i])))
-        for j in range(i, p):
-            hj = max(h, h * abs(float(theta_hat[j])))
-            if i == j:
-                ei = np.zeros(p); ei[i] = hi
-                H[i, i] = (loglik(theta_hat + ei)
-                            + loglik(theta_hat - ei) - 2.0 * ll0) / hi ** 2
-            else:
-                ei = np.zeros(p); ei[i] = hi
-                ej = np.zeros(p); ej[j] = hj
-                H[i, j] = (loglik(theta_hat + ei + ej)
-                            - loglik(theta_hat + ei - ej)
-                            - loglik(theta_hat - ei + ej)
-                            + loglik(theta_hat - ei - ej)) / (4.0 * hi * hj)
-                H[j, i] = H[i, j]
-
-    neg_H = -H
-    try:
-        avar = N * linalg.inv(neg_H)
-    except linalg.LinAlgError:
-        avar = N * linalg.pinv(neg_H)
-    return avar   # (2k+2, 2k+2)
-
-
-def qmle_static(Y: np.ndarray,
-                X: np.ndarray,
-                W_static: np.ndarray,
-                eigvals_W_static: np.ndarray,
-                delta_bounds: Tuple[float, float] = (-0.9999, 0.9999),
-                n_grid: int = 60) -> float:
-    """
-    Misspecified QMLE using a static (exogenous) W, WITHOUT the CF augmentation.
-    Useful as a baseline comparison.
-
-    Parameters
-    ----------
-    W_static           : (N, N) static weight matrix (e.g. I_T ⊗ W_S)
-    eigvals_W_static   : precomputed eigenvalues of W_static
-
-    Returns
-    -------
-    delta_hat : scalar point estimate
-    """
-    Y = np.asarray(Y, float).ravel()
-    X = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-
-    R = np.column_stack([X, W_static @ X])
-    logdet_fn = lambda d: logdet_full(d, eigvals_W_static)
-    objective = lambda d: profile_loglik(d, Y, W_static, R, logdet_fn, sign=-1.0)
-
-    lo, hi = delta_bounds
-    grid    = np.linspace(lo + 0.01, hi - 0.01, n_grid)
-    ll_grid = np.array([objective(d) for d in grid])
-    best_idx = int(np.argmin(ll_grid))
-    d_lo = grid[max(best_idx - 2, 0)]
-    d_hi = grid[min(best_idx + 2, n_grid - 1)]
-
-    res = optimize.minimize_scalar(
-        objective, bounds=(d_lo, d_hi), method="bounded",
-        options={"xatol": 1e-10}
-    )
-    return float(res.x)
+    names = names or [nm for nm in fit["names"] if nm.startswith("delta_")]
+    idx = [fit["names"].index(nm) for nm in names]
+    b = fit["theta"][idx]
+    V = fit["V_information"][np.ix_(idx, idx)]
+    w = float(b @ linalg.solve(V, b))
+    return {"stat": w, "df": len(idx), "p": float(stats.chi2.sf(w, len(idx))), "names": list(names)}

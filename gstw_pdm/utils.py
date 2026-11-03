@@ -9,7 +9,7 @@ Contents
 2. Eigenvalue decomposition helpers
 3. Panel data reshaping (time-major ↔ unit-major)
 4. Condition number and stability checks
-5. Pretty-print helpers
+5. Pretty-print helper
 """
 
 from __future__ import annotations
@@ -105,14 +105,14 @@ def spectral_radius(A: np.ndarray) -> float:
     return float(np.max(np.abs(linalg.eigvals(A))))
 
 
-def check_admissibility(delta: float,
-                        eigvals_M: np.ndarray,
-                        eigvals_WS: np.ndarray) -> bool:
+def check_admissibility(rho, eigvals_M: np.ndarray, eigvals_WS: np.ndarray) -> bool:
     """
-    Check whether I - delta·W is non-singular (i.e. all 1 - δ·μ·λ > 0).
+    Kronecker weights: is I - rho0 I_T kron W_S - rho1 M kron W_S non-singular,
+    i.e. 1 - (rho0 + rho1 mu_j) lambda_i != 0 for all eigenvalue pairs (eq. (2.5))?
     """
-    products = np.outer(eigvals_M, eigvals_WS).ravel()
-    return bool(np.all(1.0 - delta * products > 0))
+    rho0, rho1 = rho
+    z = 1 - np.outer(rho0 + rho1 * np.asarray(eigvals_M), np.asarray(eigvals_WS))
+    return bool(np.all(np.abs(z) > 1e-12))
 
 
 # ---------------------------------------------------------------------------
@@ -223,40 +223,3 @@ def print_dict(d: dict, title: str = "", indent: int = 2) -> None:
             print(f"{pad}  {k}: array{v.shape}")
         else:
             print(f"{pad}  {k}: {v}")
-
-
-def summarise_results(cf2sls: Optional[dict] = None,
-                      cfqmle: Optional[dict] = None,
-                      cfgmm: Optional[dict] = None) -> None:
-    """Side-by-side comparison of CF-2SLS / CF-QMLE / CF-GMM estimates."""
-    print("\n" + "=" * 75)
-    print("  Estimation Results Comparison")
-    print("=" * 75)
-    print(f"  {'Parameter':<12} {'CF-2SLS':>14} {'CF-QMLE':>14} {'CF-GMM':>14}")
-    print("-" * 75)
-
-    if cf2sls is not None:
-        names  = cf2sls["param_names"]
-        k2sls  = cf2sls["kappa"]
-        s2sls  = cf2sls["se"]
-    else:
-        names  = []
-        k2sls  = s2sls  = []
-
-    # CF-QMLE packs (delta, alpha) differently
-    if cfqmle is not None:
-        d_q   = cfqmle["delta_hat"]
-        a_q   = cfqmle["alpha_hat"]
-        kqmle = np.concatenate([[d_q], a_q])
-    else:
-        kqmle = None
-
-    kgmm = cfgmm["kappa"] if cfgmm is not None else None
-
-    for i, name in enumerate(names):
-        v2 = f"{k2sls[i]:>8.4f}({s2sls[i]:.4f})" if cf2sls else "    —"
-        vq = f"{kqmle[i]:>8.4f}" if (kqmle is not None and i < len(kqmle)) else "    —"
-        vg = f"{kgmm[i]:>8.4f}({cfgmm['se'][i]:.4f})" if (kgmm is not None and i < len(kgmm)) else "    —"
-        print(f"  {name:<12} {v2:>14} {vq:>14} {vg:>14}")
-    print("=" * 75)
-    print("  Coef(SE) shown where SE available.\n")

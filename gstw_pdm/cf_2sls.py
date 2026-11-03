@@ -1,265 +1,142 @@
 """
 cf_2sls.py
 ----------
-Control-Function Two-Stage Least Squares (CF-2SLS) estimator for Spatial
-Durbin Models with endogenous Spatio-Temporal Weight Matrices.
+Control-function 2SLS (paper, eq. (3.6), Appendix H).
 
-Structural equation
--------------------
-    Y = δ·WY + X·β + WX·θ + ε̄̂·δ_c + ξ
+Regress Y on
 
-    ⟺  Y = U_tilde · κ + ξ
+    Ubar = [W_j Y, X, W_j X, E, eb_hat]
 
-where  U_tilde = [WY, X, WX, ε̄̂]   (augmented regressors)
-and     Q      = [X,  WX, W²X, ε̄̂]  (instrument set).
+with instruments
 
-CF-2SLS estimator
------------------
-    κ̂ = (Û'U_tilde)^{-1} Û'Y,   Û = P_Q U_tilde,   P_Q = Q(Q'Q)^{-1}Q'
+    Qbar = [X, W_j X, W_j W_l X (all ordered pairs), E, eb_hat],
 
-Variance–covariance (corrected for generated regressor ε̄̂)
--------------------------------------------------------------
-The sandwich formula depends on whether L = T or L = N:
+so that for the paper's two lag matrices W^2 X stands for W_0^2 X, W_0 W_1 X,
+W_1 W_0 X and W_1^2 X. The control removes the endogeneity of W and the
+instruments handle the simultaneity of W Y; only linear moments are used.
 
-  L = T  →  plug in Ω_A correction (see variance_correction.py)
-  L = N  →  standard 2SLS sandwich  V = σ²(Û'U_tilde)^{-1}
+Variance (Theorem H.2): with e = xi + delta_c delta, delta = A Z_W (pi_hat - pi),
 
-References
-----------
-Paper Section 5 & Appendix B.
+    Var = B Ubar'P_Q Sigma_e P_Q Ubar B,   B = (Ubar' P_Q Ubar)^{-1},
+    Sigma_e = sigma2 I + sum_{a,b} dc_a dc_b A Z_a Cov(pi_a, pi_b) Z_b' A'.
+
+At L = N this is consistent. At L = T sigma_eps^2 comes from T residuals and the
+plug-in is consistent only when the local imbalance Omega_A is zero (Appendix H);
+a warning is issued.
 """
 
 from __future__ import annotations
+import warnings
 import numpy as np
-from scipy import linalg
+from scipy import linalg, stats
 from typing import Optional
 
+from .cf_qmle import _cols, _full_rank, _Z, control_from_first_stage, joint_pi_covariance_pooled
 
-# ---------------------------------------------------------------------------
-# Core CF-2SLS
-# ---------------------------------------------------------------------------
 
-def cf_2sls(Y: np.ndarray,
-            X: np.ndarray,
-            W: np.ndarray,
-            bar_eps_hat: np.ndarray) -> np.ndarray:
+def cf_2sls_design(y, X, net, durbin: bool = True, extra=None, first_stages: Optional[dict] = None,
+                   controls: Optional[dict] = None, x_names=None, extra_names=None, power: int = 2):
+    """Ubar, Qbar and the names of Ubar. power = 2 adds W_j W_l X; power = 3 adds W_j W_l W_m X too."""
+    y = np.asarray(y, float).ravel()
+    N = len(y)
+    X = _cols(X, N)
+    E = _cols(extra, N)
+    x_names = list(x_names) if x_names is not None else [f"x{i + 1}" for i in range(X.shape[1])]
+    e_names = list(extra_names) if extra_names is not None else [f"e{i + 1}" for i in range(E.shape[1])]
+    WX = [W @ X for W in net.W]
+    cols, cnames, ctrl_names = [], [], []
+    for m, fs in (first_stages or {}).items():
+        cols.append(control_from_first_stage(fs, net.n, net.T))
+        cnames.append("delta_" + m)
+        ctrl_names.append(m)
+    for m, c in (controls or {}).items():
+        cols.append(np.asarray(c, float).ravel())
+        cnames.append("delta_" + m)
+    C = np.column_stack(cols) if cols else np.zeros((N, 0))
+    # regressors
+    U = np.column_stack([W @ y for W in net.W])
+    Rb = [X] + (WX if durbin else []) + [E, C]
+    Rn = list(x_names) + ([f"{nm}*{x}" for nm in net.names for x in x_names] if durbin else []) + e_names + cnames
+    R = np.column_stack(Rb)
+    keep = _full_rank(R)
+    R, Rn = R[:, keep], [Rn[i] for i in keep]
+    Ub = np.column_stack([U, R])
+    names = list(net.names) + Rn
+    # instruments
+    inst = [X] + WX
+    level = WX
+    for _ in range(power - 1):
+        level = [W @ A for W in net.W for A in level]
+        inst += level
+    inst += [E, C]
+    Q = np.column_stack(inst)
+    Q = Q[:, _full_rank(Q)]
+    return y, Ub, Q, names
+
+
+def cf_2sls(y, X, net, first_stages: Optional[dict] = None, controls: Optional[dict] = None,
+            durbin: bool = True, extra=None, x_names=None, extra_names=None, power: int = 2,
+            robust: bool = False) -> dict:
     """
-    CF-2SLS point estimates.
+    CF-2SLS estimate and variance.
 
-    Parameters
-    ----------
-    Y           : (N,) dependent variable
-    X           : (N, k) exogenous regressors
-    W           : (N, N) spatio-temporal weight matrix
-    bar_eps_hat : (N,) aggregated control function  ε̄̂
+    Parameters as in cf_qmle; power sets the highest power of W in the instruments.
+    robust=True replaces sigma2 I in Sigma_e by diag(e_i^2) (heteroskedasticity).
 
-    Returns
-    -------
-    kappa_hat : (k+3,) = [δ̂, β̂₁…β̂_k, θ̂₁…θ̂_k, δ̂_c]
-        Ordering: [δ̂,  β̂ (k,),  θ̂ (k,),  δ̂_c]
+    Returns dict with theta, names, se, V, V_no_generated, sigma2, resid,
+    first-stage partial F of each spatial lag on the excluded instruments.
     """
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    bar_eps_hat = np.asarray(bar_eps_hat, float).ravel()[:, None]
-
-    WY  = (W @ Y)[:, None]
-    WX  = W @ X
-    W2X = W @ WX
-
-    U_tilde = np.column_stack([WY, X, WX, bar_eps_hat])   # (N, 2k+2)
-    Q       = np.column_stack([X,  WX, W2X, bar_eps_hat]) # (N, 2k+2)
-
-    QtQ_inv = linalg.pinv(Q.T @ Q)
-    P_Q_U   = Q @ (QtQ_inv @ (Q.T @ U_tilde))             # (N, 2k+2)
-    P_Q_Y   = Q @ (QtQ_inv @ (Q.T @ Y))                   # (N,)
-
-    A_mat = P_Q_U.T @ U_tilde                              # (2k+2, 2k+2)
-    b_vec = P_Q_U.T @ Y                                    # (2k+2,)
-
-    try:
-        kappa_hat = linalg.solve(A_mat, b_vec)
-    except linalg.LinAlgError:
-        kappa_hat = np.full(A_mat.shape[0], np.nan)
-
-    return kappa_hat
-
-
-def cf_2sls_residuals(Y: np.ndarray,
-                      X: np.ndarray,
-                      W: np.ndarray,
-                      bar_eps_hat: np.ndarray,
-                      kappa_hat: np.ndarray) -> np.ndarray:
-    """Return structural residuals ξ̂ = Y - U_tilde κ̂."""
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    bar_eps_hat = np.asarray(bar_eps_hat, float).ravel()[:, None]
-
-    WY  = (W @ Y)[:, None]
-    WX  = W @ X
-    U_tilde = np.column_stack([WY, X, WX, bar_eps_hat])
-    return Y - U_tilde @ kappa_hat
-
-
-# ---------------------------------------------------------------------------
-# Asymptotic variance (homoskedastic sandwich)
-# ---------------------------------------------------------------------------
-
-def cf_2sls_avar(Y: np.ndarray,
-                 X: np.ndarray,
-                 W: np.ndarray,
-                 bar_eps_hat: np.ndarray,
-                 kappa_hat: np.ndarray,
-                 sigma2: Optional[float] = None,
-                 omega_A: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Asymptotic variance–covariance matrix of sqrt(N)·(κ̂ − κ₀).
-
-    Standard formula (homoskedastic, L = N case):
-        AVar = σ² · N · (Û'U)^{-1}
-
-    With Ω_A correction (L = T case):
-        The variance is augmented by an additional term from the generated
-        regressor ε̄̂ = Aε̂.  Pass ``omega_A`` (from variance_correction.py)
-        to include this correction.
-
-    Parameters
-    ----------
-    Y, X, W, bar_eps_hat, kappa_hat : as in ``cf_2sls``
-    sigma2  : error variance; estimated from residuals if None
-    omega_A : (2k+2, 2k+2) variance correction matrix for generated regressors
-              (only needed for L = T mode); see ``variance_correction.omega_A``
-
-    Returns
-    -------
-    avar : (2k+2, 2k+2)  AVar of sqrt(N)·κ̂  (divide by N for finite-sample Var)
-    """
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    N = len(Y)
-    bar_eps_hat = np.asarray(bar_eps_hat, float).ravel()[:, None]
-
-    WY  = (W @ Y)[:, None]
-    WX  = W @ X
-    W2X = W @ WX
-
-    U_tilde = np.column_stack([WY, X, WX, bar_eps_hat])
-    Q       = np.column_stack([X,  WX, W2X, bar_eps_hat])
-
-    xi_hat = Y - U_tilde @ kappa_hat
-    if sigma2 is None:
-        sigma2 = float(xi_hat @ xi_hat) / N
-
-    QtQ_inv = linalg.pinv(Q.T @ Q)
-    P_Q_U   = Q @ (QtQ_inv @ (Q.T @ U_tilde))
-
-    # Bread: B = (Û'U/N)^{-1}
-    bread = linalg.pinv(P_Q_U.T @ U_tilde / N)
-
-    # Meat (standard): σ² · Û'Û/N²  — under homoskedasticity simplifies
-    meat_std = sigma2 * (P_Q_U.T @ P_Q_U) / N
-
-    avar = bread @ meat_std @ bread
-
-    # Add Ω_A correction if provided (L = T case)
-    if omega_A is not None:
-        avar = avar + bread @ omega_A @ bread
-
-    return avar
+    y, Ub, Q, names = cf_2sls_design(y, X, net, durbin, extra, first_stages, controls, x_names, extra_names, power)
+    N, P = Ub.shape
+    Qo = linalg.orth(Q)
+    PU = Qo @ (Qo.T @ Ub)
+    B = linalg.inv(PU.T @ Ub)
+    kap = B @ (PU.T @ y)
+    e = y - Ub @ kap
+    s2 = float(e @ e / (N - P))
+    meat = (PU.T * (e ** 2 if robust else s2)) @ PU
+    V0 = B @ meat @ B
+    V = V0
+    gen = {m: fs for m, fs in (first_stages or {}).items() if "delta_" + m in names}
+    if gen:
+        L = {len(fs["eps_hat"]) for fs in gen.values()}
+        if L != {N}:
+            warnings.warn("first stage with L = T: the generated-regressor variance uses sigma_eps^2 from T "
+                          "residuals and is consistent only when Omega_A = 0 (paper, Appendix H).")
+        modes = list(gen)
+        Sig = joint_pi_covariance_pooled([gen[m] for m in modes])
+        H = []
+        for m in modes:
+            ci = names.index("delta_" + m)
+            ctl = Ub[:, ci]
+            eh = np.asarray(gen[m]["eps_hat"], float)
+            Z = _Z(gen[m])
+            AZ = Z if len(eh) == N else np.repeat(Z, net.n, axis=0)
+            AE = ctl if len(eh) == N else ctl[::net.n]
+            scale = float(AE @ eh / (eh @ eh))
+            H.append(kap[ci] * scale * (PU.T @ AZ))
+        H = np.column_stack(H)
+        V = B @ (meat + H @ Sig @ H.T) @ B
+    # partial F of each spatial lag on the excluded instruments
+    Rcols = Ub[:, len(net.names):]
+    Ro = linalg.orth(Rcols)
+    Qt = Q - Ro @ (Ro.T @ Q)
+    Qt = Qt[:, _full_rank(Qt)]
+    F = []
+    for j in range(len(net.names)):
+        u = Ub[:, j] - Ro @ (Ro.T @ Ub[:, j])
+        b = linalg.lstsq(Qt, u)[0]
+        r = u - Qt @ b
+        F.append(float(((u @ u - r @ r) / Qt.shape[1]) / (r @ r / (N - Qt.shape[1] - Ro.shape[1]))))
+    se = np.sqrt(np.maximum(np.diag(V), 0))
+    z = kap / np.where(se > 0, se, np.nan)
+    return {"estimator": "CF-2SLS", "theta": kap, "names": names, "V": V, "V_no_generated": V0, "se": se,
+            "z": z, "p": 2 * stats.norm.sf(np.abs(z)), "sigma2": s2, "resid": e, "N": N,
+            "partial_F": np.array(F), "n_instruments": int(Q.shape[1])}
 
 
-def cf_2sls_se(avar: np.ndarray, N: int) -> np.ndarray:
-    """
-    Standard errors = sqrt(diag(AVar / N)).
-
-    Parameters
-    ----------
-    avar : (p, p) asymptotic variance of sqrt(N)·κ̂
-    N    : sample size
-
-    Returns
-    -------
-    se : (p,) standard errors of κ̂
-    """
-    return np.sqrt(np.maximum(np.diag(avar) / N, 0.0))
-
-
-# ---------------------------------------------------------------------------
-# Full estimation with summary
-# ---------------------------------------------------------------------------
-
-def cf_2sls_fit(Y: np.ndarray,
-                X: np.ndarray,
-                W: np.ndarray,
-                bar_eps_hat: np.ndarray,
-                sigma2: Optional[float] = None,
-                omega_A: Optional[np.ndarray] = None,
-                param_names: Optional[list] = None) -> dict:
-    """
-    CF-2SLS estimation with coefficients, SE, t-stats, p-values.
-
-    Returns
-    -------
-    dict with keys:
-        kappa, se, t_stats, p_values, sigma2, avar,
-        residuals, param_names
-    """
-    from scipy import stats as scipy_stats
-
-    Y   = np.asarray(Y, float).ravel()
-    X   = np.asarray(X, float)
-    if X.ndim == 1:
-        X = X[:, None]
-    N, k = X.shape
-
-    kappa_hat = cf_2sls(Y, X, W, bar_eps_hat)
-    xi_hat    = cf_2sls_residuals(Y, X, W, bar_eps_hat, kappa_hat)
-    sigma2_   = float(xi_hat @ xi_hat) / N if sigma2 is None else sigma2
-    avar      = cf_2sls_avar(Y, X, W, bar_eps_hat, kappa_hat,
-                             sigma2=sigma2_, omega_A=omega_A)
-    se        = cf_2sls_se(avar, N)
-    t_stats   = kappa_hat / np.where(se > 1e-14, se, np.nan)
-    p_values  = 2 * scipy_stats.t.sf(np.abs(t_stats), df=N - len(kappa_hat))
-
-    if param_names is None:
-        x_names = [f"x{i+1}" for i in range(k)]
-        param_names = (["delta"] + x_names
-                       + [f"theta_{n}" for n in x_names]
-                       + ["delta_c"])
-
-    return {
-        "kappa"      : kappa_hat,
-        "se"         : se,
-        "t_stats"    : t_stats,
-        "p_values"   : p_values,
-        "sigma2"     : sigma2_,
-        "avar"       : avar,
-        "residuals"  : xi_hat,
-        "param_names": param_names,
-        "N"          : N,
-    }
-
-
-def cf_2sls_summary(result: dict) -> None:
-    """Print a formatted CF-2SLS results table."""
-    print("\n" + "=" * 65)
-    print("  CF-2SLS Estimation Results")
-    print("=" * 65)
-    print(f"  N = {result['N']},  σ̂² = {result['sigma2']:.6f}")
-    print("-" * 65)
-    print(f"  {'Parameter':<14} {'Coef':>10} {'SE':>10} {'t':>8} {'p':>8}")
-    print("-" * 65)
-    for name, coef, se, t, p in zip(result["param_names"],
-                                     result["kappa"],
-                                     result["se"],
-                                     result["t_stats"],
-                                     result["p_values"]):
-        stars = "***" if p < 0.01 else ("**" if p < 0.05 else ("*" if p < 0.1 else ""))
-        print(f"  {name:<14} {coef:>10.4f} {se:>10.4f} {t:>8.3f} {p:>8.4f} {stars}")
-    print("=" * 65)
-    print("  * p<0.1  ** p<0.05  *** p<0.01\n")
+def cf_2sls_summary(result: dict) -> str:
+    """Stata-style table of a cf_2sls or cf_qmle result."""
+    from .report import regression_table
+    k = len(result["se"])
+    return regression_table(result["names"][:k], result["theta"][:k], result["se"], title=result.get("estimator", ""))

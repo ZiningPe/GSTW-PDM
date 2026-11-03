@@ -1,323 +1,270 @@
 """
 test_estimators.py
 ------------------
-Unit and integration tests for gstw_pdm.
+Checks of the estimators against the paper (Sections 2-6) on small synthetic panels.
 
 Run with:  pytest tests/ -v
 """
 
+import warnings
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose
+from scipy import linalg, sparse
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import gstw_pdm as g
 
-from gstw_pdm import (
-    rook_weights, build_twm_parametric, build_stwm, stwm_summary,
-    compute_morans_i, eigvals_kronecker, logdet_kronecker,
-    first_stage, aggregate_eps_hat,
-    cf_2sls, cf_2sls_fit,
-    cf_qmle,
-    cf_gmm,
-    bh_correction,
-    multiplier_matrix, cross_period_effects_matrix,
-    omega_A_simple, compute_sigma2_eps,
-    ned_test, check_admissibility,
-)
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def small_dgp():
-    """
-    Minimal DGP: n=9 (3×3 grid), T=4, single regressor.
-    Returns Y, X, W, W_S, M, h, Z_W, eps_hat, bar_eps_hat with known delta=0.3.
-    """
+def kron():
     rng = np.random.default_rng(42)
-    n_side = 3
-    T      = 4
-    n      = n_side ** 2
-    N      = n * T
-
-    W_S = rook_weights(n_side)
-    M   = build_twm_parametric(T, rho=0.5)
-    W   = build_stwm(M, W_S)
-
-    X     = rng.standard_normal((N, 1))
-    Z_W   = rng.standard_normal((T, 2))
-    eps   = rng.standard_normal(T)
-    h     = (Z_W @ np.array([1.0, 0.5])) + eps
-
-    eps_hat, pi_hat = first_stage(h, Z_W)
-    bar_eps_hat     = aggregate_eps_hat(eps_hat, n, T)
-
-    delta0   = 0.3
-    beta0    = 1.0
-    theta0   = 0.5
-    delta_c0 = 0.4
-
-    # Generate Y from known parameters
-    bar_eps_true = np.repeat(eps, n)
-    xi   = rng.standard_normal(N) * 0.5
-    S    = np.eye(N) - delta0 * W
-    rhs  = X.ravel() * beta0 + (W @ X).ravel() * theta0 + bar_eps_true * delta_c0 + xi
-    Y    = np.linalg.solve(S, rhs)
-
-    return dict(Y=Y, X=X, W=W, W_S=W_S, M=M, h=h, Z_W=Z_W,
-                eps_hat=eps_hat, bar_eps_hat=bar_eps_hat,
-                n=n, T=T, N=N, n_side=n_side,
-                delta0=delta0, beta0=beta0, theta0=theta0)
+    n_side, T = 6, 4
+    n = n_side ** 2
+    N = n * T
+    Ws = g.rook_weights(n_side)
+    M = g.build_twm_parametric(T, rho=0.5)
+    net = g.KroneckerNetwork(M, Ws)
+    W0, W1 = (W.toarray() for W in net.W)
+    S = np.eye(N) - 0.3 * W0 - 0.2 * W1
+    X = rng.normal(size=(N, 1))
+    Z = np.column_stack([np.ones(N), X[:, 0], rng.normal(size=(N, 2))])
+    eps = rng.normal(size=N)
+    h = Z @ np.array([0.0, 0.8, 1.0, 1.0]) + eps
+    y = linalg.solve(S, X[:, 0] + 0.5 * W0 @ X[:, 0] + 0.3 * W1 @ X[:, 0] + 0.6 * eps + 0.7 * rng.normal(size=N))
+    return dict(n=n, T=T, N=N, Ws=Ws, M=M, net=net, W0=W0, W1=W1, X=X, Z=Z, h=h, y=y, rng=rng)
 
 
-# ---------------------------------------------------------------------------
-# Weight construction
-# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def big():
+    rng = np.random.default_rng(11)
+    n_side, T = 10, 5
+    n = n_side ** 2
+    N = n * T
+    Ws = g.rook_weights(n_side)
+    M = g.build_twm_parametric(T, rho=0.5)
+    net = g.KroneckerNetwork(M, Ws)
+    W0, W1 = (W.toarray() for W in net.W)
+    S = np.eye(N) - 0.3 * W0 - 0.2 * W1
+    X = rng.normal(size=(N, 1))
+    Z = np.column_stack([np.ones(N), X[:, 0], rng.normal(size=(N, 2))])
+    eps = rng.normal(size=N)
+    h = Z @ np.array([0.0, 0.8, 1.0, 1.0]) + eps
+    y = linalg.solve(S, X[:, 0] + 0.5 * W0 @ X[:, 0] + 0.3 * W1 @ X[:, 0] + 0.6 * eps + 0.7 * rng.normal(size=N))
+    yT = linalg.solve(S, X[:, 0] + 0.5 * W0 @ X[:, 0] + 0.3 * W1 @ X[:, 0]
+                      + np.repeat(2 * rng.normal(size=T), n) + 0.7 * rng.normal(size=N))
+    truth = {"rho0": 0.3, "rho1": 0.2, "x1": 1.0, "rho0*x1": 0.5, "rho1*x1": 0.3}
+    return dict(n=n, T=T, N=N, Ws=Ws, M=M, net=net, X=X, Z=Z, h=h, y=y, yT=yT, truth=truth)
 
-class TestWeightConstruction:
+
+class TestWeights:
     def test_rook_row_sum(self):
-        W = rook_weights(5)
-        assert_allclose(W.sum(axis=1), np.ones(25), atol=1e-10)
+        assert np.allclose(g.rook_weights(4).sum(1), 1)
 
-    def test_stwm_shape(self):
-        W_S = rook_weights(4)
-        M   = build_twm_parametric(5)
-        W   = build_stwm(M, W_S)
-        assert W.shape == (80, 80)
+    def test_kronecker_blocks(self, kron):
+        W0, W1 = g.kronecker_weights(kron["M"], kron["Ws"])
+        assert np.allclose(W0, kron["W0"]) and np.allclose(W1, kron["W1"])
+        assert np.allclose(W0.sum(1), 1) and np.allclose(W1.sum(1), 1)
 
-    def test_kronecker_structure(self):
-        W_S = rook_weights(3)
-        M   = build_twm_parametric(4, rho=0.6)
-        W   = build_stwm(M, W_S)
-        W_kron = np.kron(M, W_S)
-        assert_allclose(W, W_kron, atol=1e-12)
+    def test_logdet_kronecker(self, kron):
+        eM, eW = g.eigvals_kronecker(kron["M"], kron["Ws"])
+        for r in [(0.3, 0.2), (-0.4, 0.5)]:
+            S = np.eye(kron["N"]) - r[0] * kron["W0"] - r[1] * kron["W1"]
+            assert abs(g.logdet_kronecker(r, eM, eW) - np.linalg.slogdet(S)[1]) < 1e-8
 
-    def test_stwm_summary_keys(self):
-        W = build_stwm(build_twm_parametric(3), rook_weights(3))
-        s = stwm_summary(W, 9, 3)
-        for key in ["sparsity", "spectral_radius", "N"]:
-            assert key in s
+    def test_block_row_normalise(self, kron):
+        n, T = kron["n"], kron["T"]
+        W0, W1 = g.block_row_normalise(sparse.csr_matrix(3 * kron["W0"] + kron["W1"]), n, T)
+        assert np.allclose(W0.toarray(), kron["W0"]) and np.allclose(W1.toarray(), kron["W1"])
 
-    def test_morans_i_random(self):
-        rng = np.random.default_rng(0)
-        y   = rng.standard_normal(25)
-        W   = rook_weights(5)
-        mi  = compute_morans_i(y, W)
-        assert -1.5 < mi < 1.5
-
-    def test_logdet_kronecker_matches_direct(self):
-        W_S = rook_weights(3)
-        M   = build_twm_parametric(4, rho=0.5)
-        W   = build_stwm(M, W_S)
-        eM, eWS = eigvals_kronecker(M, W_S)
-        N  = W.shape[0]
-        delta = 0.2
-        ld_kron  = logdet_kronecker(delta, eM, eWS)
-        _, logdet_sign = np.linalg.slogdet(np.eye(N) - delta * W)
-        ld_direct = logdet_sign
-        assert abs(ld_kron - ld_direct) < 1e-6
+    def test_parameter_space(self, kron):
+        ps = g.parameter_space(kron["W0"], kron["W1"], kron["n"], kron["T"])
+        assert ps["row_sum_W0"] <= 1 + 1e-12 and ps["row_sum_W1"] <= 1 + 1e-12
+        assert ps["zero_diagonal"] and not ps["recursive"]
 
 
-# ---------------------------------------------------------------------------
-# First stage & control function
-# ---------------------------------------------------------------------------
+class TestNetworks:
+    def test_dense_kron_recursive_logdet(self, kron):
+        n, T = kron["n"], kron["T"]
+        W1r = np.tril(kron["W1"])
+        dn = g.DenseNetwork([("a", kron["W0"]), ("b", W1r)], n, T)
+        rn = g.make_network([("a", kron["W0"]), ("b", W1r)], n, T)
+        assert isinstance(rn, g.RecursiveNetwork)
+        assert abs(dn.factor([0.3, 0.7]) - rn.factor([0.3, 0.7])) < 1e-9
+        B = kron["rng"].normal(size=(kron["N"], 2))
+        assert np.abs(dn.solve(B) - rn.solve(B)).max() < 1e-10
+
+    def test_make_network_dense(self, kron):
+        net = g.make_network([("W", kron["W0"] + kron["W1"])], kron["n"], kron["T"])
+        assert isinstance(net, g.DenseNetwork)
+
 
 class TestFirstStage:
-    def test_residuals_orthogonal_to_Z(self, small_dgp):
-        dgp = small_dgp
-        eps_hat = dgp["eps_hat"]
-        Z_W     = dgp["Z_W"]
-        assert_allclose(Z_W.T @ eps_hat, np.zeros(Z_W.shape[1]), atol=1e-8)
+    def test_residual_orthogonal(self, kron):
+        fs = g.first_stage_fit(kron["h"], kron["Z"], n_instruments=4)
+        assert np.abs(kron["Z"].T @ fs["eps_hat"]).max() < 1e-8
+        assert fs["dof"] == kron["N"] - 4 and fs["F"] > 10
 
-    def test_aggregate_length(self, small_dgp):
-        dgp = small_dgp
-        bar_eps = aggregate_eps_hat(dgp["eps_hat"], dgp["n"], dgp["T"])
-        assert len(bar_eps) == dgp["N"]
+    def test_aggregate_L_eq_T(self):
+        assert np.allclose(g.aggregate_eps_hat(np.array([1.0, 2.0]), 3, 2), [1, 1, 1, 2, 2, 2])
 
-    def test_aggregate_period_values(self, small_dgp):
-        dgp = small_dgp
-        bar = aggregate_eps_hat(dgp["eps_hat"], dgp["n"], dgp["T"])
-        n, T = dgp["n"], dgp["T"]
-        for t in range(T):
-            assert_allclose(bar[t * n:(t + 1) * n],
-                            dgp["eps_hat"][t] * np.ones(n), atol=1e-12)
-
-
-# ---------------------------------------------------------------------------
-# CF-2SLS
-# ---------------------------------------------------------------------------
-
-class TestCF2SLS:
-    def test_shape(self, small_dgp):
-        dgp = small_dgp
-        kappa = cf_2sls(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        assert kappa.shape == (4,)   # delta, beta, theta, delta_c  (k=1)
-
-    def test_finite(self, small_dgp):
-        dgp = small_dgp
-        kappa = cf_2sls(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        assert np.all(np.isfinite(kappa))
-
-    def test_delta_sign(self, small_dgp):
-        """CF-2SLS should recover positive delta (=0.3 in DGP)."""
-        dgp   = small_dgp
-        kappa = cf_2sls(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        assert kappa[0] > 0.0
-
-    def test_fit_dict_keys(self, small_dgp):
-        dgp    = small_dgp
-        result = cf_2sls_fit(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        for key in ["kappa", "se", "t_stats", "p_values", "sigma2"]:
-            assert key in result
-
-    def test_se_positive(self, small_dgp):
-        dgp    = small_dgp
-        result = cf_2sls_fit(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        assert np.all(result["se"] >= 0)
-
-
-# ---------------------------------------------------------------------------
-# CF-QMLE
-# ---------------------------------------------------------------------------
 
 class TestCFQMLE:
-    def test_delta_in_bounds(self, small_dgp):
-        dgp = small_dgp
-        res = cf_qmle(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"],
-                      M=dgp["M"], W_S=dgp["W_S"])
-        assert -1 < res["delta_hat"] < 1
+    def test_kron_equals_dense(self, kron):
+        fs = g.first_stage_fit(kron["h"], kron["Z"])
+        dn = g.DenseNetwork([("rho0", kron["W0"]), ("rho1", kron["W1"])], kron["n"], kron["T"])
+        a = g.cf_qmle(kron["y"], kron["X"], kron["net"], {"h": fs}, extra=np.ones(kron["N"]))
+        b = g.cf_qmle(kron["y"], kron["X"], dn, {"h": fs}, extra=np.ones(kron["N"]))
+        assert np.abs(a["theta"] - b["theta"]).max() < 1e-6
+        assert np.abs(a["se"] - b["se"]).max() < 1e-6
 
-    def test_sigma2_positive(self, small_dgp):
-        dgp = small_dgp
-        res = cf_qmle(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"],
-                      M=dgp["M"], W_S=dgp["W_S"])
-        assert res["sigma2_hat"] > 0
+    def test_names_and_generated_term(self, kron):
+        fs = g.first_stage_fit(kron["h"], kron["Z"])
+        f = g.cf_qmle(kron["y"], kron["X"], kron["net"], {"h": fs}, extra=np.ones(kron["N"]), extra_names=["const"])
+        assert f["names"][:5] == ["rho0", "rho1", "x1", "rho0*x1", "rho1*x1"]
+        i = f["names"].index("x1")
+        # X is in the first stage, so the beta variance gains the generated-regressor term
+        assert f["se"][i] > f["se_information"][i] * 1.05
+        # the delta_c and sigma2 rows of D are zero (Theorem 2)
+        assert np.allclose(f["D"][f["names"].index("delta_h")], 0) and np.allclose(f["D"][-1], 0)
 
-    def test_kronecker_vs_full(self, small_dgp):
-        """Kronecker and full-eigenvalue log-det should give same δ̂."""
-        dgp    = small_dgp
-        res_kr = cf_qmle(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"],
-                         M=dgp["M"], W_S=dgp["W_S"])
-        res_fu = cf_qmle(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        assert abs(res_kr["delta_hat"] - res_fu["delta_hat"]) < 1e-4
+    def test_gaussian_sandwich_close_to_information(self, kron):
+        f = g.qmle(kron["y"], kron["X"], kron["net"], extra=np.ones(kron["N"]))
+        # mean-parameter block; the sigma2 entry depends on the sample kurtosis
+        assert np.allclose(f["V"][:-1, :-1], f["V_information"][:-1, :-1], rtol=0.05, atol=1e-5)
 
+    def test_lq_variance_by_simulation(self):
+        """Score variance with skewed errors: Lemma 9 against simulation."""
+        rng = np.random.default_rng(3)
+        n_side, T = 5, 3
+        n = n_side ** 2
+        N = n * T
+        net = g.KroneckerNetwork(g.build_twm_parametric(T, 0.5), g.rook_weights(n_side))
+        W0, W1 = (W.toarray() for W in net.W)
+        rho = np.array([0.3, 0.2])
+        S = np.eye(N) - rho[0] * W0 - rho[1] * W1
+        R = np.column_stack([np.ones(N), rng.normal(size=N)])
+        gam = np.array([0.5, 1.0])
+        s2 = 2.0
+        from gstw_pdm.cf_qmle import qmle_information_and_score_variance
+        draws = (rng.chisquare(2, size=(4000, N)) - 2) / 2 * np.sqrt(s2)
+        m3, m4 = np.mean(draws ** 3), np.mean(draws ** 4)
+        Info, V, _ = qmle_information_and_score_variance(net, R, rho, gam, s2, m3, m4)
+        Sinv = linalg.inv(S)
+        G = [W0 @ Sinv, W1 @ Sinv]
+        sc = []
+        for xi in draws:
+            Y = Sinv @ (R @ gam + xi)
+            s = [(W @ Y) @ xi / s2 - np.trace(Gj) for W, Gj in zip([W0, W1], G)]
+            s += list(R.T @ xi / s2) + [xi @ xi / (2 * s2 ** 2) - N / (2 * s2)]
+            sc.append(s)
+        Vs = np.cov(np.array(sc).T)
+        d = np.sqrt(np.diag(V))
+        assert np.abs(Vs / np.outer(d, d) - V / np.outer(d, d)).max() < 0.08
 
-# ---------------------------------------------------------------------------
-# CF-GMM
-# ---------------------------------------------------------------------------
-
-class TestCFGMM:
-    def test_shape(self, small_dgp):
-        dgp  = small_dgp
-        kappa, sig2, _ = cf_gmm(dgp["Y"], dgp["X"], dgp["W"],
-                                  dgp["bar_eps_hat"], max_iter=1)
-        assert kappa.shape == (4,)
-
-    def test_sigma2_positive(self, small_dgp):
-        dgp  = small_dgp
-        _, sig2, _ = cf_gmm(dgp["Y"], dgp["X"], dgp["W"],
-                             dgp["bar_eps_hat"], max_iter=1)
-        assert sig2 > 0
-
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
-class TestInference:
-    def test_multiplier_matrix_shape(self, small_dgp):
-        dgp = small_dgp
-        T_mat = multiplier_matrix(0.2, dgp["W"])
-        assert T_mat.shape == (dgp["N"], dgp["N"])
-
-    def test_ie_matrix_shape(self, small_dgp):
-        dgp   = small_dgp
-        T_mat = multiplier_matrix(0.2, dgp["W"])
-        IE    = cross_period_effects_matrix(
-            T_mat, 1.0, 0.5, dgp["W"], dgp["n"], dgp["T"]
-        )
-        assert IE.shape == (dgp["T"], dgp["T"])
-
-    def test_bh_correction_shape(self):
-        rng  = np.random.default_rng(0)
-        pv   = rng.uniform(0, 1, (5, 5))
-        rej, adj = bh_correction(pv, alpha=0.05)
-        assert rej.shape == (5, 5)
-        assert adj.shape == (5, 5)
-        assert np.all((adj >= 0) & (adj <= 1))
-
-    def test_bh_monotone(self):
-        """Adjusted p-values should be ≥ raw p-values."""
-        rng  = np.random.default_rng(1)
-        pv   = np.sort(rng.uniform(0, 1, 20))
-        _, adj = bh_correction(pv)
-        # BH-adjusted ≥ raw for the individual comparison
-        assert np.all(adj >= pv - 1e-10)
+    def test_wald_delta_c(self, kron):
+        fs = g.first_stage_fit(kron["h"], kron["Z"])
+        f = g.cf_qmle(kron["y"], kron["X"], kron["net"], {"h": fs}, extra=np.ones(kron["N"]))
+        w = g.wald_delta_c(f)
+        assert w["df"] == 1 and w["p"] < 0.01
 
 
-# ---------------------------------------------------------------------------
-# Variance correction
-# ---------------------------------------------------------------------------
-
-class TestVarianceCorrection:
-    def test_omega_A_shape(self, small_dgp):
-        dgp    = small_dgp
-        N, T   = dgp["N"], dgp["T"]
-        n      = dgp["n"]
-        bar    = dgp["bar_eps_hat"]
-        X      = dgp["X"]
-        W      = dgp["W"]
-        Z_W    = dgp["Z_W"]
-
-        WX  = W @ X
-        W2X = W @ WX
-        Q   = np.column_stack([X, WX, W2X, bar[:, None]])  # (N, 4)
-
-        sig2_eps = compute_sigma2_eps(dgp["eps_hat"], Z_W)
-        omega = omega_A_simple(Q, Z_W, n, T, delta_c_hat=0.3,
-                               sigma2_eps=sig2_eps)
-        assert omega.shape == (4, 4)
-
-    def test_omega_A_psd(self, small_dgp):
-        dgp  = small_dgp
-        n, T = dgp["n"], dgp["T"]
-        X, W = dgp["X"], dgp["W"]
-        Z_W  = dgp["Z_W"]
-        bar  = dgp["bar_eps_hat"]
-
-        WX  = W @ X; W2X = W @ WX
-        Q   = np.column_stack([X, WX, W2X, bar[:, None]])
-        sig2_eps = compute_sigma2_eps(dgp["eps_hat"], Z_W)
-        omega = omega_A_simple(Q, Z_W, n, T, 0.3, sig2_eps)
-
-        eigvals = np.linalg.eigvalsh(omega)
-        assert np.all(eigvals >= -1e-10), "Ω_A should be PSD"
+class TestCF2SLS:
+    def test_close_to_truth(self, big):
+        fs = g.first_stage_fit(big["h"], big["Z"])
+        a = g.cf_2sls(big["y"], big["X"], big["net"], {"h": fs}, extra=np.ones(big["N"]))
+        b = g.cf_qmle(big["y"], big["X"], big["net"], {"h": fs}, extra=np.ones(big["N"]))
+        assert a["names"] == b["names"][:-1]
+        for k, v in big["truth"].items():
+            i = a["names"].index(k)
+            assert abs(a["theta"][i] - v) < 4 * a["se"][i]
+        assert np.all(a["se"] > 0) and np.all(a["partial_F"] > 10)
+        assert np.all(a["se"] >= np.sqrt(np.diag(a["V_no_generated"])) - 1e-12)
 
 
-# ---------------------------------------------------------------------------
-# Utils
-# ---------------------------------------------------------------------------
+class TestPeriodLevel:
+    def test_within_period_removes_period_constants(self, kron):
+        n, T, N = kron["n"], kron["T"], kron["N"]
+        rng = np.random.default_rng(7)
+        S = np.eye(N) - 0.3 * kron["W0"] - 0.2 * kron["W1"]
+        X = rng.normal(size=(N, 1))
+        y = linalg.solve(S, X[:, 0] + np.repeat(5 * rng.normal(size=T), n) + 0.5 * rng.normal(size=N))
+        w = g.within_period_qmle(y, X, kron["M"], kron["Ws"], durbin=False)
+        # adding any period constants to the outcome equation leaves the estimate unchanged
+        y2 = linalg.solve(S, S @ y + np.repeat(rng.normal(size=T), n))
+        w2 = g.within_period_qmle(y2, X, kron["M"], kron["Ws"], durbin=False)
+        assert np.abs(w["theta"] - w2["theta"]).max() < 1e-6
+        assert w["N_star"] == T * (n - 1)
+
+    def test_anderson_rubin(self, big):
+        ar = g.anderson_rubin(big["yT"], big["X"], big["M"], big["Ws"], (0.3, 0.2))
+        far = g.anderson_rubin(big["yT"], big["X"], big["M"], big["Ws"], (-0.3, 0.8))
+        assert ar["p"] > 0.01 and far["p"] < 0.01
+        assert ar["df"][1] == big["T"] * (big["n"] - 1) - 3 - ar["df"][0]
+
+    def test_within_period_close_to_truth(self, big):
+        w = g.within_period_qmle(big["yT"], big["X"], big["M"], big["Ws"])
+        for k, v in big["truth"].items():
+            i = w["names"].index(k)
+            assert abs(w["theta"][i] - v) < 4 * w["se"][i]
+
+    def test_naive_warns_at_L_eq_T(self, kron):
+        n, T, N = kron["n"], kron["T"], kron["N"]
+        fs = g.first_stage_fit(np.arange(T, dtype=float) + np.random.default_rng(1).normal(size=T),
+                               np.column_stack([np.ones(T), np.arange(T)]))
+        with pytest.warns(UserWarning):
+            g.cf_qmle(kron["y"], kron["X"], kron["net"], {"h": fs}, extra=np.ones(N))
+
+
+class TestEffects:
+    def test_effects_match_dense(self, kron):
+        n, T, N = kron["n"], kron["T"], kron["N"]
+        f = g.qmle(kron["y"], kron["X"], kron["net"], extra=np.ones(N))
+        ef = g.effects_inference(kron["net"], f, "x1")
+        th = dict(zip(f["names"], f["theta"]))
+        Sk = linalg.inv(np.eye(N) - th["rho0"] * kron["W0"] - th["rho1"] * kron["W1"]) @ (
+            th["x1"] * np.eye(N) + th["rho0*x1"] * kron["W0"] + th["rho1*x1"] * kron["W1"])
+        IE = np.array([[Sk[t * n:(t + 1) * n, s * n:(s + 1) * n].sum() / n for s in range(T)] for t in range(T)])
+        assert np.abs(IE - ef["IE"]).max() < 1e-10
+        assert np.allclose(ef["DE"] + ef["IEw"], np.diag(IE))
+        assert np.all(ef["SE"] > 0)
+
+    def test_block_diagonal_has_no_cross_effects(self, kron):
+        n, T, N = kron["n"], kron["T"], kron["N"]
+        net = g.DenseNetwork([("rho0", kron["W0"])], n, T)
+        f = g.qmle(kron["y"], kron["X"], net, extra=np.ones(N))
+        ef = g.effects_inference(net, f, "x1", direct=False)
+        assert np.abs(ef["IE"][~np.eye(T, dtype=bool)]).max() < 1e-12
+
+    def test_fdr(self):
+        p = np.array([0.001, 0.01, 0.02, 0.04, 0.5])
+        rb, ab = g.bh_correction(p, 0.05)
+        ry, ay = g.by_correction(p, 0.05)
+        assert rb.sum() >= ry.sum() and np.all(ay >= ab)
+        assert rb[:4].all() and not rb[4]
+
+
+class TestFixedEffects:
+    def test_dummy_drift_zero_for_block_diagonal(self, kron):
+        n, T = kron["n"], kron["T"]
+        net = g.RecursiveNetwork([("rho0", sparse.csr_matrix(kron["W0"]), False)], n, T)
+        assert abs(g.dummy_drift(net, [0.3])["drift"][0]) < 1e-9
+
+    def test_dummy_drift_matches_dense(self, kron):
+        n, T, N = kron["n"], kron["T"], kron["N"]
+        W1 = np.tril(kron["W1"])
+        net = g.RecursiveNetwork([("a", sparse.csr_matrix(kron["W0"]), False), ("b", sparse.csr_matrix(W1), True)], n, T)
+        d = g.dummy_drift(net, [0.3, 0.4])
+        Sinv = linalg.inv(np.eye(N) - 0.3 * kron["W0"] - 0.4 * W1)
+        for j, Wj in enumerate([kron["W0"], W1]):
+            G = Wj @ Sinv
+            cr = sum(np.trace(G[t * n:(t + 1) * n, s * n:(s + 1) * n]) for t in range(T) for s in range(T) if t != s)
+            assert abs(d["drift"][j] + cr / (T - 1)) < 1e-9
+
 
 class TestUtils:
-    def test_ned_test_keys(self, small_dgp):
-        dgp = small_dgp
-        kappa = cf_2sls(dgp["Y"], dgp["X"], dgp["W"], dgp["bar_eps_hat"])
-        xi_hat = dgp["Y"] - (
-            dgp["W"] @ dgp["Y"] * kappa[0]
-            + dgp["X"].ravel() * kappa[1]
-            + (dgp["W"] @ dgp["X"]).ravel() * kappa[2]
-            + dgp["bar_eps_hat"] * kappa[3]
-        )
-        result = ned_test(xi_hat, dgp["n"], dgp["T"], dgp["W_S"])
-        for key in ["morans_by_period", "temporal_autocorr", "summary"]:
-            assert key in result
+    def test_check_admissibility(self, kron):
+        eM, eW = g.eigvals_kronecker(kron["M"], kron["Ws"])
+        assert g.check_admissibility((0.3, 0.2), eM, eW)
 
-    def test_check_admissibility(self, small_dgp):
-        dgp = small_dgp
-        from gstw_pdm import eigvals_kronecker
-        eM, eWS = eigvals_kronecker(dgp["M"], dgp["W_S"])
-        assert check_admissibility(0.2, eM, eWS)
-        assert not check_admissibility(100.0, eM, eWS)
+    def test_ned_keys(self, kron):
+        out = g.ned_test(kron["y"], kron["n"], kron["T"], kron["Ws"])
+        assert {"morans_by_period", "temporal_autocorr"} <= set(out)

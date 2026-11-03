@@ -1,395 +1,194 @@
 """
 inference.py
 ------------
-Post-estimation inference for the CF-2SLS / CF-QMLE / CF-GMM estimators:
+Spillover effects and their inference (paper, eq. (2.3) and Section 6).
 
-  1. Cross-period (indirect) effects  IE_{r, t←s}
-  2. Delta-method standard errors for nonlinear functions of κ̂
-  3. Benjamini-Hochberg FDR control for multiple testing
+The effect of regressor k is the N x N matrix
 
-Cross-period effects
---------------------
-After estimating κ̂ = (δ̂, β̂, θ̂, δ̂_c), the total multiplier matrix is
+    S_k = S(rho)^{-1} (beta_k I + sum_j theta_jk W_j),
 
-    T_mat = (I − δ̂·W)^{-1}  ∈ ℝ^{N×N}
+and its block averages are
 
-The indirect effect from spatial unit s in period τ on unit r in period t is
+    DE_t       = n^{-1} tr([S_k]_(t,t))                        direct effect
+    IEw_t      = n^{-1} iota' [S_k]_(t,t) iota - DE_t            within-period indirect
+    IE_(t<-s)  = n^{-1} iota' [S_k]_(t,s) iota,  t != s          cross-period (eq. (6.1))
 
-    IE_{(r,t) ← (s,τ)}(X) = T_mat[(r,t), (s,τ)] · (β̂ + θ̂·w_{(s,τ)})
+Standard errors use the delta method with the analytic gradient (eq. (6.3)):
+d/d rho_j = n^{-1} iota'[S^{-1} W_j S_k]_(t,s) iota, d/d beta_k = n^{-1} iota'[S^{-1}]_(t,s) iota,
+d/d theta_jk = n^{-1} iota'[S^{-1} W_j]_(t,s) iota. The block sums need one solve with
+T right-hand sides; the direct effects need the diagonal blocks of S^{-1}.
 
-For the aggregate (average) cross-period effect averaged over spatial units:
-
-    IE_{t←s} = (1/n) Σ_r Σ_i T_mat[(r,t),(i,s)] · (β̂ + θ̂·w_{(i,s)})
-
-Delta method standard errors propagate uncertainty in (δ̂, β̂, θ̂) through
-the nonlinear function  IE(κ) via numerical gradients.
-
-References
-----------
-Paper Section 8 & Appendix E.
-LeSage, J. & Pace, R. K. (2009). Introduction to Spatial Econometrics. CRC Press.
-Benjamini, Y. & Hochberg, Y. (1995). J. Royal Stat. Soc. B, 57(1), 289–300.
+Multiple testing over the T(T-1)/2 (recursive) or T(T-1) cross-period effects uses the
+step-up procedure of Benjamini-Hochberg, or Benjamini-Yekutieli, which does not need
+the positive dependence the shared estimate would have to satisfy.
 """
 
 from __future__ import annotations
 import numpy as np
-from scipy import linalg, stats as scipy_stats
+from scipy import linalg, stats
 from typing import Optional, Sequence
 
 
-# ---------------------------------------------------------------------------
-# 1.  Multiplier matrix
-# ---------------------------------------------------------------------------
+def _period_indicators(n: int, T: int) -> np.ndarray:
+    return np.kron(np.eye(T), np.ones((n, 1)))          # (N, T), column s = indicator of period s
 
-def multiplier_matrix(delta: float, W: np.ndarray) -> np.ndarray:
+
+def _block_means(A: np.ndarray, n: int, T: int) -> np.ndarray:
+    """(N, T) -> (T, T): mean over the units of each destination period."""
+    return A.reshape(T, n, -1).mean(1)
+
+
+def _diag_block_traces(A: np.ndarray, n: int, T: int) -> np.ndarray:
+    d = np.diag(A).reshape(T, n)
+    return d.mean(1)
+
+
+def spillover_effects(net, rho, beta: float, theta: Sequence[float], direct: bool = True) -> dict:
     """
-    Compute total spatial multiplier  T = (I − δ·W)^{-1}.
+    Block-averaged effects of one regressor.
 
-    Parameters
-    ----------
-    delta : estimated spatial-lag parameter
-    W     : (N, N) weight matrix
-
-    Returns
-    -------
-    T_mat : (N, N)  — row (r,t), column (s,τ)
+    theta holds theta_jk for each lag matrix of net (zeros if the model has no Durbin term).
+    Returns IE (T x T; the diagonal holds the total same-period effect DE + IEw), DE, IEw.
     """
-    N = W.shape[0]
-    return linalg.inv(np.eye(N) - delta * W)
+    n, T = net.n, net.T
+    assert np.isfinite(net.factor(rho))
+    D = _period_indicators(n, T)
+    V = beta * D + sum(th * (W @ D) for th, W in zip(theta, net.W))
+    IE = _block_means(net.solve(V), n, T)
+    out = {"IE": IE}
+    if direct:
+        Sinv = net.inverse()
+        Sk = beta * Sinv + sum(th * (Sinv @ W.toarray()) for th, W in zip(theta, net.W))
+        out["DE"] = _diag_block_traces(Sk, n, T)
+        out["IEw"] = np.diag(IE) - out["DE"]
+    return out
 
 
-def multiplier_matrix_approx(delta: float, W: np.ndarray,
-                              order: int = 10) -> np.ndarray:
+def effects_inference(net, fit: dict, x: str, V: Optional[np.ndarray] = None, direct: bool = True,
+                      alpha: float = 0.05, fdr: str = "by") -> dict:
     """
-    Neumann series approximation  T ≈ Σ_{k=0}^{order} (δW)^k.
+    Effects of regressor x with delta-method standard errors.
 
-    Faster than direct inversion for large N; accuracy depends on |δ·ρ(W)| < 1.
+    fit is a cf_qmle / cf_2sls / within_period_qmle / aqs_fit result (names, theta, V);
+    the Durbin coefficients are the entries named '<lag>*<x>'. V overrides fit['V']
+    (for example a cluster-robust variance). The cross-period p-values are adjusted
+    with fdr = 'bh' or 'by'.
     """
-    N = W.shape[0]
-    T = np.eye(N)
-    dW_k = np.eye(N)
-    for _ in range(order):
-        dW_k = delta * W @ dW_k
-        T    = T + dW_k
-    return T
-
-
-# ---------------------------------------------------------------------------
-# 2.  Cross-period indirect effects
-# ---------------------------------------------------------------------------
-
-def _unit_idx(unit: int, period: int, n: int) -> int:
-    """Index of (unit, period) in the time-major stacked vector."""
-    return period * n + unit
-
-
-def cross_period_effect(T_mat: np.ndarray,
-                        beta,
-                        theta,
-                        W: np.ndarray,
-                        n: int,
-                        t: int,
-                        s: int,
-                        r: Optional[int] = None) -> float:
-    """
-    Cross-period indirect effect  IE_{r,t←s}  (or average over r).
-
-    For k regressors with coefficient vectors β ∈ ℝᵏ and θ ∈ ℝᵏ, the
-    effect at destination (r, t) from source unit i in period s is:
-
-        Σ_j  T_mat[(r,t),(i,s)] · (β_j + θ_j · w_{i,s})
-
-    where w_{i,s} is the row sum of W at row (i,s).  Summing over all
-    source units i and averaging over destinations r gives IE_{t←s}.
-
-    Scalars are accepted for the k=1 case (backward compatible).
-
-    Parameters
-    ----------
-    T_mat       : (N, N) multiplier matrix
-    beta, theta : scalar or (k,) array of structural coefficients
-    W           : (N, N) weight matrix
-    n           : number of spatial units
-    t, s        : destination and source time periods
-    r           : destination unit (None → average over all r)
-
-    Returns
-    -------
-    Indirect effect (scalar) — sum over k regressors
-    """
-    beta  = np.atleast_1d(np.asarray(beta,  float))
-    theta = np.atleast_1d(np.asarray(theta, float))
-
-    # Source column indices for period s
-    src_cols     = [_unit_idx(i, s, n) for i in range(n)]
-    w_row_sums_s = W[src_cols, :].sum(axis=1)   # (n,) row sums at source period
-
-    # Scalar marginal effect for each source unit i: Σ_j (β_j + θ_j·w_i)
-    marg = float(beta.sum()) + float(theta.sum()) * w_row_sums_s   # (n,)
-
-    if r is None:
-        dst_rows = np.array([_unit_idx(ri, t, n) for ri in range(n)])
-        # T_mat[dst_rows, :][:, src_cols] is (n_dst, n_src)
-        T_sub = T_mat[np.ix_(dst_rows, src_cols)]   # (n, n)
-        return float(T_sub.sum(axis=0) @ marg) / n
-    else:
-        dst = _unit_idx(r, t, n)
-        T_row = T_mat[dst, src_cols]    # (n,)
-        return float(T_row @ marg)
-
-
-def cross_period_effects_matrix(T_mat: np.ndarray,
-                                beta,
-                                theta,
-                                W: np.ndarray,
-                                n: int,
-                                TT: int) -> np.ndarray:
-    """
-    Compute all T×T average cross-period effects  IE_{t←s}.
-
-    beta, theta may be scalars (k=1) or (k,) arrays (k>1).
-
-    Returns
-    -------
-    IE : (TT, TT) matrix,  IE[t, s] = average indirect effect from s to t
-    """
-    IE = np.zeros((TT, TT))
-    for t in range(TT):
-        for s in range(TT):
-            IE[t, s] = cross_period_effect(T_mat, beta, theta, W, n, t, s)
-    return IE
-
-
-# ---------------------------------------------------------------------------
-# 3.  Delta method standard errors
-# ---------------------------------------------------------------------------
-
-def delta_method_se(fn,
-                    kappa: np.ndarray,
-                    avar_kappa: np.ndarray,
-                    N: int,
-                    h: float = 1e-5) -> tuple[float, float]:
-    """
-    Delta method SE for a scalar function fn(κ).
-
-    Var(fn(κ̂)) ≈ (∂fn/∂κ)' · (AVar_κ / N) · (∂fn/∂κ)
-
-    Parameters
-    ----------
-    fn         : callable(kappa) → scalar
-    kappa      : (p,) parameter estimates
-    avar_kappa : (p, p) asymptotic variance of sqrt(N)·(κ̂ − κ₀)
-    N          : sample size
-    h          : base finite-difference step (scaled to parameter magnitude)
-
-    Returns
-    -------
-    (estimate, standard_error)
-    """
-    f0   = float(fn(kappa))
-    p    = len(kappa)
-    grad = np.zeros(p)
+    names = list(fit["names"])
+    theta_hat = np.asarray(fit["theta"], float)
+    V = fit["V"] if V is None else V
+    p = len(net.names)
+    i_rho = [names.index(nm) for nm in net.names]
+    i_beta = names.index(x)
+    i_th = [names.index(f"{nm}*{x}") if f"{nm}*{x}" in names else None for nm in net.names]
+    rho = theta_hat[i_rho]
+    beta = theta_hat[i_beta]
+    th = np.array([theta_hat[i] if i is not None else 0.0 for i in i_th])
+    n, T = net.n, net.T
+    assert np.isfinite(net.factor(rho))
+    D = _period_indicators(n, T)
+    WD = [W @ D for W in net.W]
+    SD = net.solve(D)                                           # S^{-1} u_s
+    SWD = [net.solve(w) for w in WD]                            # S^{-1} W_j u_s
+    Z = beta * SD + sum(t * s for t, s in zip(th, SWD))         # S_k u_s
+    IE = _block_means(Z, n, T)
+    grads = {}                                                  # index -> (T, T) gradient
     for j in range(p):
-        # Relative step: h_j = max(h, h * |κ_j|) so it scales with parameter magnitude
-        hj = max(h, h * abs(float(kappa[j])))
-        e  = np.zeros(p); e[j] = hj
-        grad[j] = (fn(kappa + e) - fn(kappa - e)) / (2 * hj)
-
-    var_f = float(grad @ (avar_kappa / N) @ grad)
-    se    = np.sqrt(max(var_f, 0.0))
-    return f0, se
-
-
-def ie_inference(T_mat: np.ndarray,
-                 kappa: np.ndarray,
-                 avar_kappa: np.ndarray,
-                 W: np.ndarray,
-                 n: int,
-                 TT: int,
-                 N: int,
-                 delta_idx: int = 0,
-                 beta_slice: slice = None,
-                 theta_slice: slice = None) -> dict:
-    """
-    Compute IE_{t←s} matrix with Delta-method SEs using analytical gradients.
-
-    Assumes κ = [δ, β (k,), θ (k,), δ_c].  For k>1 set beta_slice /
-    theta_slice explicitly.
-
-    Analytical gradients (no repeated matrix inversion):
-        ∂IE/∂β_j  = T_sub.sum() / n              (same for all j)
-        ∂IE/∂θ_j  = T_sub.sum(0) @ w_s / n       (same for all j)
-        ∂IE/∂δ    = F_sub.sum(0) @ marg / n       F = T·W·T
-        ∂IE/∂δ_c  = 0
-
-    T_mat and F = T·W·T are pre-computed once (2 matrix ops total vs
-    O(p·T²) inversions with numerical differentiation).
-
-    Parameters
-    ----------
-    T_mat       : (N, N) pre-computed multiplier (I − δ̂W)⁻¹
-    delta_idx   : index of δ in kappa
-    beta_slice  : slice for β in kappa
-    theta_slice : slice for θ in kappa
-
-    Returns
-    -------
-    dict with IE (TT×TT), SE (TT×TT), t_stat (TT×TT), p_value (TT×TT)
-    """
-    p = len(kappa)
-    k = (p - 2) // 2
-    if beta_slice is None:
-        beta_slice  = slice(1, 1 + k)
-    if theta_slice is None:
-        theta_slice = slice(1 + k, 1 + 2 * k)
-
-    beta_hat  = kappa[beta_slice]    # (k,)
-    theta_hat = kappa[theta_slice]   # (k,)
-    sum_beta  = float(beta_hat.sum())
-    sum_theta = float(theta_hat.sum())
-
-    # F = T·W·T  — needed for ∂IE/∂δ  (one matrix multiply, no inversion)
-    F = T_mat @ W @ T_mat   # (N, N)
-
-    avar_per_obs = avar_kappa / N   # (p, p)
-
-    IE_mat = np.zeros((TT, TT))
-    SE_mat = np.zeros((TT, TT))
-
-    for t in range(TT):
-        dst_rows = np.array([_unit_idx(ri, t, n) for ri in range(n)])
-        for s in range(TT):
-            src_cols = np.array([_unit_idx(i, s, n) for i in range(n)])
-            w_s      = W[np.ix_(src_cols, np.arange(W.shape[1]))].sum(1)  # (n,)
-            marg     = sum_beta + sum_theta * w_s                          # (n,)
-
-            T_sub = T_mat[np.ix_(dst_rows, src_cols)]   # (n, n)
-            col_sum = T_sub.sum(axis=0)                  # (n,)
-
-            ie_val = float(col_sum @ marg) / n
-            IE_mat[t, s] = ie_val
-
-            # Analytical gradient  ∂IE/∂κ
-            grad = np.zeros(p)
-            # ∂/∂δ: use F_sub
-            F_sub = F[np.ix_(dst_rows, src_cols)]
-            grad[delta_idx] = float(F_sub.sum(axis=0) @ marg) / n
-            # ∂/∂β_j: same for all j
-            d_beta = T_sub.sum() / n
-            grad[beta_slice] = d_beta
-            # ∂/∂θ_j: same for all j
-            d_theta = float(col_sum @ w_s) / n
-            grad[theta_slice] = d_theta
-            # ∂/∂δ_c = 0 (already zero)
-
-            var_ie = float(grad @ avar_per_obs @ grad)
-            SE_mat[t, s] = np.sqrt(max(var_ie, 0.0))
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t_stat = np.where(SE_mat > 0, IE_mat / SE_mat, np.nan)
-    p_val = 2 * scipy_stats.norm.sf(np.abs(t_stat))
-
-    return {
-        "IE"     : IE_mat,
-        "SE"     : SE_mat,
-        "t_stat" : t_stat,
-        "p_value": p_val,
-    }
+        grads[i_rho[j]] = _block_means(net.solve(net.W[j] @ Z), n, T)
+    grads[i_beta] = _block_means(SD, n, T)
+    for j in range(p):
+        if i_th[j] is not None:
+            grads[i_th[j]] = _block_means(SWD[j], n, T)
+    idx = sorted(grads)
+    Gt = np.stack([grads[i] for i in idx], -1)                  # (T, T, q)
+    Vs = V[np.ix_(idx, idx)]
+    SE = np.sqrt(np.maximum(np.einsum("tsa,ab,tsb->ts", Gt, Vs, Gt), 0))
+    zt = IE / np.where(SE > 0, SE, np.nan)
+    pv = 2 * stats.norm.sf(np.abs(zt))
+    out = {"IE": IE, "SE": SE, "z": zt, "p": pv}
+    # recursive weights: effects above the diagonal are zero and not tested
+    off = ~np.eye(T, dtype=bool)
+    lower = np.tril(np.ones((T, T), bool), -1)
+    test = lower if np.allclose(IE[np.triu_indices(T, 1)], 0) else off
+    padj = np.full((T, T), np.nan)
+    rej = np.zeros((T, T), bool)
+    r_, a_ = fdr_correction(pv[test], alpha, fdr)
+    padj[test], rej[test] = a_, r_
+    out.update({"p_adjusted": padj, "reject": rej, "tested": test, "fdr": fdr})
+    if direct:
+        Sinv = net.inverse()
+        SW = [Sinv @ W.toarray() for W in net.W]
+        Sk = beta * Sinv + sum(t * s for t, s in zip(th, SW))
+        dmean = lambda A: _diag_block_traces(A, n, T)
+        DE = dmean(Sk)
+        gD = {}
+        for j in range(p):
+            gD[i_rho[j]] = dmean(SW[j] @ Sk)
+        gD[i_beta] = dmean(Sinv)
+        for j in range(p):
+            if i_th[j] is not None:
+                gD[i_th[j]] = dmean(SW[j])
+        Gd = np.stack([gD[i] for i in idx], -1)                 # (T, q)
+        se_DE = np.sqrt(np.maximum(np.einsum("ta,ab,tb->t", Gd, Vs, Gd), 0))
+        diagIE = np.diag(IE)
+        Gw = np.stack([np.diagonal(grads[i]) - gD[i] for i in idx], -1)
+        se_IEw = np.sqrt(np.maximum(np.einsum("ta,ab,tb->t", Gw, Vs, Gw), 0))
+        out.update({"DE": DE, "SE_DE": se_DE, "IEw": diagIE - DE, "SE_IEw": se_IEw})
+    return out
 
 
 # ---------------------------------------------------------------------------
-# 4.  Benjamini-Hochberg FDR control
+# multiple testing
 # ---------------------------------------------------------------------------
 
-def bh_correction(p_values: np.ndarray,
-                  alpha: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
+def fdr_correction(p_values, alpha: float = 0.05, method: str = "bh"):
     """
-    Benjamini-Hochberg (1995) False Discovery Rate correction.
+    Step-up FDR procedure: 'bh' (Benjamini-Hochberg 1995) or 'by'
+    (Benjamini-Yekutieli 2001, alpha divided by sum_{j<=R} 1/j).
 
-    Parameters
-    ----------
-    p_values : array of p-values (any shape; flattened internally)
-    alpha    : target FDR level
-
-    Returns
-    -------
-    reject      : boolean array (same shape as p_values), True = reject H₀
-    adjusted_p  : BH-adjusted p-values (same shape)
+    Returns (reject, adjusted p-values), both with the shape of p_values.
     """
+    p_values = np.asarray(p_values, float)
     shape = p_values.shape
-    pv    = p_values.ravel()
-    m     = len(pv)
-
-    order   = np.argsort(pv)
-    pv_sort = pv[order]
-    thresholds = alpha * np.arange(1, m + 1) / m
-
-    reject_sort = pv_sort <= thresholds
-    # All hypotheses up to the last rejected one are also rejected
-    if reject_sort.any():
-        last_reject = np.where(reject_sort)[0].max()
-        reject_sort[:last_reject + 1] = True
-
-    # BH-adjusted p-values  (Yekutieli & Benjamini 1999 formula)
-    adj = np.minimum.accumulate((m / np.arange(m, 0, -1)) * pv_sort[::-1])[::-1]
+    pv = p_values.ravel()
+    m = len(pv)
+    if m == 0:
+        return np.zeros(shape, bool), np.zeros(shape)
+    c = np.sum(1.0 / np.arange(1, m + 1)) if method == "by" else 1.0
+    order = np.argsort(pv)
+    ps = pv[order]
+    below = ps <= alpha * np.arange(1, m + 1) / (m * c)
+    rs = np.zeros(m, bool)
+    if below.any():
+        rs[:np.where(below)[0].max() + 1] = True
+    adj = np.minimum.accumulate((c * m / np.arange(m, 0, -1)) * ps[::-1])[::-1]
     adj = np.minimum(adj, 1.0)
-
-    reject_out = np.empty(m, dtype=bool)
-    adj_out    = np.empty(m)
-    reject_out[order] = reject_sort
-    adj_out[order]    = adj
-
-    return reject_out.reshape(shape), adj_out.reshape(shape)
+    rej, pad = np.empty(m, bool), np.empty(m)
+    rej[order], pad[order] = rs, adj
+    return rej.reshape(shape), pad.reshape(shape)
 
 
-def multiple_testing_summary(IE: np.ndarray,
-                             SE: np.ndarray,
-                             p_values: np.ndarray,
-                             alpha: float = 0.05,
-                             fdr_alpha: float = 0.05) -> dict:
-    """
-    Summary table of IE_{t←s} with unadjusted and BH-adjusted decisions.
-
-    Returns
-    -------
-    dict with arrays: IE, SE, p_raw, p_bh, reject_raw, reject_bh
-    """
-    reject_raw = p_values < alpha
-    reject_bh, p_bh = bh_correction(p_values, alpha=fdr_alpha)
-
-    return {
-        "IE"        : IE,
-        "SE"        : SE,
-        "p_raw"     : p_values,
-        "p_bh"      : p_bh,
-        "reject_raw": reject_raw,
-        "reject_bh" : reject_bh,
-        "n_reject_raw": int(reject_raw.sum()),
-        "n_reject_bh" : int(reject_bh.sum()),
-    }
+def bh_correction(p_values, alpha: float = 0.05):
+    """Benjamini-Hochberg step-up procedure; returns (reject, adjusted p-values)."""
+    return fdr_correction(p_values, alpha, "bh")
 
 
-def print_ie_table(result: dict,
-                   period_labels: Optional[Sequence] = None) -> None:
-    """Print cross-period IE results with FDR-adjusted significance markers."""
-    IE  = result["IE"]
-    SE  = result["SE"]
-    p   = result.get("p_bh", result.get("p_raw"))
-    rej = result.get("reject_bh", result.get("reject_raw"))
-    TT  = IE.shape[0]
-    labs = period_labels if period_labels else list(range(TT))
+def by_correction(p_values, alpha: float = 0.05):
+    """Benjamini-Yekutieli step-up procedure; returns (reject, adjusted p-values)."""
+    return fdr_correction(p_values, alpha, "by")
 
-    print("\n" + "=" * 70)
-    print("  Cross-period Indirect Effects  IE_{t←s}")
-    print("  (SE in parentheses, * FDR-corrected significant at 5%)")
-    print("=" * 70)
-    header = "  t\\s  " + "".join(f"{str(labs[s]):>12}" for s in range(TT))
-    print(header)
-    print("-" * len(header))
-    for t in range(TT):
-        row = f"  {str(labs[t]):<5}"
-        for s in range(TT):
+
+def print_ie_table(result: dict, period_labels: Optional[Sequence] = None) -> str:
+    """Cross-period effects with SE; * marks rejection after the FDR adjustment."""
+    IE, SE, rej = result["IE"], result["SE"], result.get("reject", np.zeros_like(result["IE"], bool))
+    T = IE.shape[0]
+    labs = list(period_labels) if period_labels is not None else list(range(1, T + 1))
+    lines = [f"Cross-period effects IE(t<-s), SE in parentheses, * = rejected at FDR ({result.get('fdr', 'bh')})"]
+    lines.append("t\\s   " + "".join(f"{str(l):>17}" for l in labs))
+    for t in range(T):
+        row = f"{str(labs[t]):<6}"
+        for s in range(T):
             star = "*" if rej[t, s] else " "
-            row += f"  {IE[t,s]:>6.3f}({SE[t,s]:.3f}){star}"
-        print(row)
-    print("=" * 70)
+            row += f"  {IE[t, s]:>7.3f}({SE[t, s]:.3f}){star}"
+        lines.append(row)
+    return "\n".join(lines)

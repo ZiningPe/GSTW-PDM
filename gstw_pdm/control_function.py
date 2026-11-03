@@ -14,9 +14,9 @@ The aggregation matrix A depends on the dimension of the entry equation:
       A = I_N  ∈ ℝ^{N×N},   ε̄̂_p = ε̂_p
       Each structural observation gets its own first-stage residual directly.
 
-The control function ε̄̂ is then included as an additional regressor in the
-CF-2SLS, CF-QMLE, and CF-GMM estimators to remove the endogeneity bias
-induced by the correlation between W and the structural error.
+The control function ε̄̂ enters the CF-QMLE and CF-2SLS as an additional regressor
+(paper, Section 3). At L = T it omits a period constant that does not shrink
+with n (Proposition 3); see period_level.within_period_qmle.
 """
 
 from __future__ import annotations
